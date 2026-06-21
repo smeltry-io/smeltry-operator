@@ -36,9 +36,9 @@ tasks:
       - go build -o bin/smeltry-operator ./...
 
   test:
-    desc: Run unit tests
+    desc: Run unit tests with race detector
     cmds:
-      - go test ./...
+      - go test -race ./...
 
   vet:
     desc: Run go vet
