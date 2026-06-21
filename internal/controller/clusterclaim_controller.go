@@ -259,12 +259,17 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 		return r.fail(ctx, cc, "MachineCfgFailed", "machinecfg Job failed; check Job logs")
 	}
 
-	// 2e. Create CAPI objects.
-	if err := r.ensureCAPIObjects(ctx, cc, site); err != nil {
+	// 2e. Create CAPI objects and check control plane readiness.
+	phaseChanged, err := r.ensureCAPIObjects(ctx, cc, site)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	setCondition(cc, portalv1alpha1.ConditionMachineCfgDone, metav1.ConditionTrue, "MachineCfgComplete", "Hardware objects created")
+	if phaseChanged {
+		// Phase moved to ClusterReady — enter addon step immediately.
+		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, cc)
+	}
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, r.Status().Update(ctx, cc)
 }
 
@@ -333,8 +338,10 @@ func (r *ClusterClaimReconciler) stepExposeKubeconfig(ctx context.Context, cc *p
 	}, role); err != nil {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, client.IgnoreNotFound(err)
 	}
+	foundRule := false
 	for i, rule := range role.Rules {
 		if rulesCoversSecrets(rule) {
+			foundRule = true
 			if !containsString(rule.ResourceNames, secretName) {
 				role.Rules[i].ResourceNames = append(role.Rules[i].ResourceNames, secretName)
 				if err := r.Update(ctx, role); err != nil {
@@ -343,6 +350,10 @@ func (r *ClusterClaimReconciler) stepExposeKubeconfig(ctx context.Context, cc *p
 			}
 			break
 		}
+	}
+	if !foundRule {
+		log.Info("Role cluster-user has no rule covering secrets; requeueing", "namespace", cc.Namespace)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseReady
@@ -453,7 +464,11 @@ func buildRookValues(osdDevices map[string][]string) string {
 }
 
 func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
-	cc *portalv1alpha1.ClusterClaim, site *portalv1alpha1.SiteConfig) error {
+	cc *portalv1alpha1.ClusterClaim, site *portalv1alpha1.SiteConfig) (phaseChanged bool, err error) {
+
+	if site.Spec.OIDC.IssuerURL == "" {
+		return false, fmt.Errorf("SiteConfig %q has empty OIDC configuration", cc.Spec.Site)
+	}
 
 	tcpName := cc.Name + "-control-plane"
 	infraName := cc.Name + "-infra"
@@ -468,27 +483,27 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 	})
 	tcp.SetName(tcpName)
 	tcp.SetNamespace(cc.Namespace)
-	if err := ctrl.SetControllerReference(cc, tcp, r.Scheme); err != nil {
-		return err
+	if err2 := ctrl.SetControllerReference(cc, tcp, r.Scheme); err2 != nil {
+		return false, err2
 	}
-	if err := unstructured.SetNestedField(tcp.Object, map[string]interface{}{
+	if err2 := unstructured.SetNestedField(tcp.Object, map[string]interface{}{
 		"endpoint": map[string]interface{}{
 			"host": cc.Status.ControlPlaneIP,
 			"port": int64(6443),
 		},
-	}, "spec", "controlPlane"); err != nil {
-		return err
+	}, "spec", "controlPlane"); err2 != nil {
+		return false, err2
 	}
-	if err := unstructured.SetNestedField(tcp.Object, []interface{}{
+	if err2 := unstructured.SetNestedField(tcp.Object, []interface{}{
 		map[string]interface{}{"name": "--oidc-issuer-url", "value": site.Spec.OIDC.IssuerURL},
 		map[string]interface{}{"name": "--oidc-client-id", "value": site.Spec.OIDC.ClientID},
 		map[string]interface{}{"name": "--oidc-username-claim", "value": site.Spec.OIDC.UsernameClaim},
 		map[string]interface{}{"name": "--oidc-groups-claim", "value": site.Spec.OIDC.GroupsClaim},
-	}, "spec", "addons", "apiServerArguments"); err != nil {
-		return err
+	}, "spec", "addons", "apiServerArguments"); err2 != nil {
+		return false, err2
 	}
-	if err := r.applyUnstructured(ctx, tcp); err != nil {
-		return fmt.Errorf("TenantControlPlane: %w", err)
+	if err2 := r.applyUnstructured(ctx, tcp); err2 != nil {
+		return false, fmt.Errorf("TenantControlPlane: %w", err2)
 	}
 
 	// b. TinkerbellCluster (CAPT) — unstructured.
@@ -500,17 +515,17 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 	})
 	tbCluster.SetName(infraName)
 	tbCluster.SetNamespace(cc.Namespace)
-	if err := ctrl.SetControllerReference(cc, tbCluster, r.Scheme); err != nil {
-		return err
+	if err2 := ctrl.SetControllerReference(cc, tbCluster, r.Scheme); err2 != nil {
+		return false, err2
 	}
-	if err := unstructured.SetNestedField(tbCluster.Object, map[string]interface{}{
+	if err2 := unstructured.SetNestedField(tbCluster.Object, map[string]interface{}{
 		"host": cc.Status.ControlPlaneIP,
 		"port": int64(6443),
-	}, "spec", "controlPlaneEndpoint"); err != nil {
-		return err
+	}, "spec", "controlPlaneEndpoint"); err2 != nil {
+		return false, err2
 	}
-	if err := r.applyUnstructured(ctx, tbCluster); err != nil {
-		return fmt.Errorf("TinkerbellCluster: %w", err)
+	if err2 := r.applyUnstructured(ctx, tbCluster); err2 != nil {
+		return false, fmt.Errorf("TinkerbellCluster: %w", err2)
 	}
 
 	// c. CAPI Cluster (typed).
@@ -527,10 +542,10 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 			},
 		},
 	}
-	if err := ctrl.SetControllerReference(cc, capiCluster, r.Scheme); err != nil {
-		return err
+	if err2 := ctrl.SetControllerReference(cc, capiCluster, r.Scheme); err2 != nil {
+		return false, err2
 	}
-	_, err := ctrl.CreateOrUpdate(ctx, r.Client, capiCluster, func() error {
+	if _, err2 := ctrl.CreateOrUpdate(ctx, r.Client, capiCluster, func() error {
 		capiCluster.Spec.InfrastructureRef = &corev1.ObjectReference{
 			APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 			Kind:       "TinkerbellCluster",
@@ -544,9 +559,8 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 			Namespace:  cc.Namespace,
 		}
 		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("Cluster: %w", err)
+	}); err2 != nil {
+		return false, fmt.Errorf("Cluster: %w", err2)
 	}
 
 	// d. TinkerbellMachineTemplate — unstructured.
@@ -558,14 +572,14 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 	})
 	tbMT.SetName(machineTemplateName)
 	tbMT.SetNamespace(cc.Namespace)
-	if err := ctrl.SetControllerReference(cc, tbMT, r.Scheme); err != nil {
-		return err
+	if err2 := ctrl.SetControllerReference(cc, tbMT, r.Scheme); err2 != nil {
+		return false, err2
 	}
-	if err := unstructured.SetNestedField(tbMT.Object, map[string]interface{}{}, "spec", "template", "spec"); err != nil {
-		return err
+	if err2 := unstructured.SetNestedField(tbMT.Object, map[string]interface{}{}, "spec", "template", "spec"); err2 != nil {
+		return false, err2
 	}
-	if err := r.applyUnstructured(ctx, tbMT); err != nil {
-		return fmt.Errorf("TinkerbellMachineTemplate: %w", err)
+	if err2 := r.applyUnstructured(ctx, tbMT); err2 != nil {
+		return false, fmt.Errorf("TinkerbellMachineTemplate: %w", err2)
 	}
 
 	// e. MachineDeployment (CAPI typed).
@@ -576,10 +590,10 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 			Namespace: cc.Namespace,
 		},
 	}
-	if err := ctrl.SetControllerReference(cc, md, r.Scheme); err != nil {
-		return err
+	if err2 := ctrl.SetControllerReference(cc, md, r.Scheme); err2 != nil {
+		return false, err2
 	}
-	_, err = ctrl.CreateOrUpdate(ctx, r.Client, md, func() error {
+	if _, err2 := ctrl.CreateOrUpdate(ctx, r.Client, md, func() error {
 		md.Spec.ClusterName = cc.Name
 		md.Spec.Replicas = &replicas
 		md.Spec.Template.Spec.ClusterName = cc.Name
@@ -590,9 +604,8 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 			Namespace:  cc.Namespace,
 		}
 		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("MachineDeployment: %w", err)
+	}); err2 != nil {
+		return false, fmt.Errorf("MachineDeployment: %w", err2)
 	}
 
 	// f. LoadBalancer Service for TenantControlPlane.
@@ -602,13 +615,13 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 			Namespace: cc.Namespace,
 		},
 	}
-	if err := ctrl.SetControllerReference(cc, svc, r.Scheme); err != nil {
-		return err
+	if err2 := ctrl.SetControllerReference(cc, svc, r.Scheme); err2 != nil {
+		return false, err2
 	}
-	_, err = ctrl.CreateOrUpdate(ctx, r.Client, svc, func() error {
+	if _, err2 := ctrl.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Annotations = map[string]string{
-			"io.cilium/lb-ipam-ips":           cc.Status.ControlPlaneIP,
-			"io.cilium/lb-ipam-pool":          site.Spec.Cilium.L2PoolName,
+			"io.cilium/lb-ipam-ips":  cc.Status.ControlPlaneIP,
+			"io.cilium/lb-ipam-pool": site.Spec.Cilium.L2PoolName,
 		}
 		svc.Spec.Type = corev1.ServiceTypeLoadBalancer
 		svc.Spec.Selector = map[string]string{
@@ -620,9 +633,8 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 			Protocol: corev1.ProtocolTCP,
 		}}
 		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("LoadBalancer Service: %w", err)
+	}); err2 != nil {
+		return false, fmt.Errorf("LoadBalancer Service: %w", err2)
 	}
 
 	// Update ClusterRef.
@@ -633,15 +645,16 @@ func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 
 	// Check if CAPI Cluster control plane is ready; caller handles status update.
 	existing := &clusterv1.Cluster{}
-	if err := r.Get(ctx, types.NamespacedName{Name: cc.Name, Namespace: cc.Namespace}, existing); err != nil {
-		return err
+	if err2 := r.Get(ctx, types.NamespacedName{Name: cc.Name, Namespace: cc.Namespace}, existing); err2 != nil {
+		return false, err2
 	}
 	if existing.Status.ControlPlaneReady {
 		cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseClusterReady
 		setCondition(cc, portalv1alpha1.ConditionCAPIReady, metav1.ConditionTrue, "ControlPlaneReady", "CAPI cluster control plane is ready")
+		return true, nil
 	}
 
-	return nil
+	return false, nil
 }
 
 // applyUnstructured creates the object if it does not exist, and skips update if it already does.
