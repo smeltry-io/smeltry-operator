@@ -85,9 +85,26 @@ func init() {
 
 // ── AddonProfile ───────────────────────────────────────────────────────────
 
+// HelmRef identifies a Helm chart in a repository.
+type HelmRef struct {
+	// RepoURL is the Helm repository URL.
+	RepoURL string `json:"repoURL"`
+
+	// ChartName is the name of the chart within the repository.
+	ChartName string `json:"chartName"`
+
+	// ChartVersion is the exact chart version to deploy (e.g. "1.16.2").
+	ChartVersion string `json:"chartVersion"`
+
+	// Values is an optional inline YAML string of Helm values.
+	// For rook-ceph, OSD device mappings are merged in at reconciliation time.
+	// +optional
+	Values string `json:"values,omitempty"`
+}
+
 // AddonComponent describes one addon in a profile.
 type AddonComponent struct {
-	// Name matches the Sveltos ClusterProfile name.
+	// Name is a human-readable identifier for this component (e.g. "cilium", "rook-ceph").
 	Name string `json:"name"`
 
 	// Required components must be healthy before ClusterClaim reaches Ready.
@@ -97,6 +114,9 @@ type AddonComponent struct {
 	// Order controls installation sequence. Lower values install first.
 	// +kubebuilder:validation:Minimum=1
 	Order int `json:"order"`
+
+	// HelmRef points to the Helm chart to deploy for this component.
+	HelmRef HelmRef `json:"helmRef"`
 }
 
 // MachineConstraints restricts which machine classes are compatible with a profile.
@@ -183,12 +203,30 @@ type SiteDNSConfig struct {
 	Zone string `json:"zone"`
 }
 
+// SiteOIDCConfig holds OIDC parameters injected into each TenantControlPlane kube-apiserver.
+type SiteOIDCConfig struct {
+	// IssuerURL is the OIDC issuer URL (--oidc-issuer-url).
+	IssuerURL string `json:"issuerURL"`
+
+	// ClientID is the OIDC client ID (--oidc-client-id).
+	ClientID string `json:"clientID"`
+
+	// UsernameClaim is the JWT claim used as the Kubernetes username (--oidc-username-claim).
+	// +kubebuilder:default=email
+	UsernameClaim string `json:"usernameClaim"`
+
+	// GroupsClaim is the JWT claim used as Kubernetes groups (--oidc-groups-claim).
+	// +kubebuilder:default=groups
+	GroupsClaim string `json:"groupsClaim"`
+}
+
 // SiteConfigSpec defines the desired state of SiteConfig.
 type SiteConfigSpec struct {
 	Netbox  SiteNetboxConfig  `json:"netbox"`
 	Network SiteNetworkConfig `json:"network"`
 	Cilium  SiteCiliumConfig  `json:"cilium"`
 	DNS     SiteDNSConfig     `json:"dns"`
+	OIDC    SiteOIDCConfig    `json:"oidc"`
 }
 
 // SiteConfigStatus reflects validation results checked by the admission webhook.
