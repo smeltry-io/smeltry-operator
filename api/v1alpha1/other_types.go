@@ -1,0 +1,226 @@
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// ── ServerClaim ────────────────────────────────────────────────────────────
+
+type ServerClaimPhase string
+
+const (
+	ServerClaimPhasePending      ServerClaimPhase = "Pending"
+	ServerClaimPhaseProvisioning ServerClaimPhase = "Provisioning"
+	ServerClaimPhaseReady        ServerClaimPhase = "Ready"
+	ServerClaimPhaseFailed       ServerClaimPhase = "Failed"
+)
+
+// ServerClaimSpec defines the desired state of ServerClaim.
+type ServerClaimSpec struct {
+	// MachineClass is the Netbox device model used to filter available hardware.
+	// +kubebuilder:validation:Required
+	MachineClass string `json:"machineClass"`
+
+	// Site is the Netbox site slug.
+	// +kubebuilder:validation:Required
+	Site string `json:"site"`
+
+	// OS is the operating system variant passed to the Tinkerbell workflow template.
+	// Examples: flatcar, ubuntu-2404, rocky9
+	// +kubebuilder:validation:Required
+	OS string `json:"os"`
+}
+
+// ServerClaimStatus defines the observed state of ServerClaim.
+type ServerClaimStatus struct {
+	// Phase is the current lifecycle phase.
+	// +kubebuilder:default=Pending
+	Phase ServerClaimPhase `json:"phase,omitempty"`
+
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// ServerIP is the IP allocated from Netbox IPAM.
+	ServerIP string `json:"serverIP,omitempty"`
+
+	// ServerDNS is the DNS name registered in CoreDNS.
+	ServerDNS string `json:"serverDNS,omitempty"`
+
+	// NetboxIPAMID is the Netbox IP address record ID, for deletion on finalizer.
+	NetboxIPAMID int `json:"netboxIPAMID,omitempty"`
+
+	// AllocatedMachineID is the Netbox device ID, for release on finalizer.
+	AllocatedMachineID int `json:"allocatedMachineID,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=sc
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="IP",type=string,JSONPath=`.status.serverIP`
+// +kubebuilder:printcolumn:name="OS",type=string,JSONPath=`.spec.os`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// ServerClaim is the Schema for the serverclaims API.
+// A tenant creates one ServerClaim to request a plain OS server on bare metal.
+type ServerClaim struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   ServerClaimSpec   `json:"spec,omitempty"`
+	Status ServerClaimStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// ServerClaimList contains a list of ServerClaim.
+type ServerClaimList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ServerClaim `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&ServerClaim{}, &ServerClaimList{})
+}
+
+// ── AddonProfile ───────────────────────────────────────────────────────────
+
+// AddonComponent describes one addon in a profile.
+type AddonComponent struct {
+	// Name matches the Sveltos ClusterProfile name.
+	Name string `json:"name"`
+
+	// Required components must be healthy before ClusterClaim reaches Ready.
+	// +kubebuilder:default=true
+	Required bool `json:"required"`
+
+	// Order controls installation sequence. Lower values install first.
+	// +kubebuilder:validation:Minimum=1
+	Order int `json:"order"`
+}
+
+// MachineConstraints restricts which machine classes are compatible with a profile.
+type MachineConstraints struct {
+	// RequiredTags are Netbox device tags that must ALL be present on the machine.
+	RequiredTags []string `json:"requiredTags,omitempty"`
+}
+
+// AddonProfileSpec defines the desired state of AddonProfile.
+type AddonProfileSpec struct {
+	// Description is shown to tenants in the Web UI and CLI.
+	Description string `json:"description,omitempty"`
+
+	// Components is the ordered list of addons to deploy on matching clusters.
+	// +kubebuilder:validation:MinItems=1
+	Components []AddonComponent `json:"components"`
+
+	// MachineConstraints optionally restricts which machineClasses are compatible.
+	MachineConstraints *MachineConstraints `json:"machineConstraints,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Namespaced,shortName=ap
+// +kubebuilder:printcolumn:name="Description",type=string,JSONPath=`.spec.description`
+
+// AddonProfile is the Schema for the addonprofiles API.
+// Defined by admins in portal-system; readable by tenants.
+type AddonProfile struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec AddonProfileSpec `json:"spec,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// AddonProfileList contains a list of AddonProfile.
+type AddonProfileList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []AddonProfile `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&AddonProfile{}, &AddonProfileList{})
+}
+
+// ── SiteConfig ─────────────────────────────────────────────────────────────
+
+// SiteNetboxConfig holds Netbox-specific parameters for a site.
+type SiteNetboxConfig struct {
+	// SiteSlug is the Netbox site slug (e.g. "paris-dc1").
+	SiteSlug string `json:"siteSlug"`
+
+	// ProvisioningPrefix is the IPAM prefix from which IPs are allocated.
+	// Example: "10.0.1.0/24"
+	ProvisioningPrefix string `json:"provisioningPrefix"`
+
+	// IPAMTags are Netbox tags applied to every IP reserved by the operator.
+	IPAMTags []string `json:"ipamTags,omitempty"`
+}
+
+// SiteNetworkConfig holds network topology parameters for a site.
+type SiteNetworkConfig struct {
+	// ProvisioningCIDR is the network reachable by workers at PXE boot time.
+	ProvisioningCIDR string `json:"provisioningCIDR"`
+
+	// ManagementCIDR is the out-of-band management network (BMC access).
+	ManagementCIDR string `json:"managementCIDR"`
+}
+
+// SiteCiliumConfig holds Cilium-specific parameters for a site.
+type SiteCiliumConfig struct {
+	// L2PoolName is the name of the CiliumLoadBalancerIPPool on the management cluster.
+	// Used for both the control plane Service and the tenant ingress Service.
+	L2PoolName string `json:"l2PoolName"`
+}
+
+// SiteDNSConfig holds DNS parameters for a site.
+type SiteDNSConfig struct {
+	// Zone is the DNS zone managed by CoreDNS + Netbox IPAM.
+	// Control plane: <cluster>-api.<tenant>.<zone>
+	// Webhook:       <cluster>-wh.<tenant>.<zone>
+	Zone string `json:"zone"`
+}
+
+// SiteConfigSpec defines the desired state of SiteConfig.
+type SiteConfigSpec struct {
+	Netbox  SiteNetboxConfig  `json:"netbox"`
+	Network SiteNetworkConfig `json:"network"`
+	Cilium  SiteCiliumConfig  `json:"cilium"`
+	DNS     SiteDNSConfig     `json:"dns"`
+}
+
+// SiteConfigStatus reflects validation results checked by the admission webhook.
+type SiteConfigStatus struct {
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=site
+// +kubebuilder:printcolumn:name="Prefix",type=string,JSONPath=`.spec.netbox.provisioningPrefix`
+// +kubebuilder:printcolumn:name="Zone",type=string,JSONPath=`.spec.dns.zone`
+
+// SiteConfig is the Schema for the siteconfigs API.
+// Defined by admins in portal-system. Validated by an admission webhook.
+type SiteConfig struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   SiteConfigSpec   `json:"spec,omitempty"`
+	Status SiteConfigStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// SiteConfigList contains a list of SiteConfig.
+type SiteConfigList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []SiteConfig `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&SiteConfig{}, &SiteConfigList{})
+}
