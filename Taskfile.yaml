@@ -1,0 +1,78 @@
+version: '3'
+
+vars:
+  CONTROLLER_GEN: ./bin/controller-gen
+  VERSION: '{{.VERSION | default "dev"}}'
+  IMG: ghcr.io/smeltry-io/smeltry-operator:{{.VERSION}}
+
+tasks:
+  tools:
+    desc: Download controller-gen if not already present
+    cmds:
+      - mkdir -p bin
+      - GOBIN=$(pwd)/bin go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
+    status:
+      - test -f ./bin/controller-gen
+
+  generate:
+    desc: Regenerate DeepCopy methods (zz_generated.deepcopy.go)
+    deps: [tools]
+    cmds:
+      - '{{.CONTROLLER_GEN}} object paths="./api/..."'
+
+  manifests:
+    desc: Generate CRD and RBAC manifests from kubebuilder markers
+    deps: [tools]
+    cmds:
+      - >
+        {{.CONTROLLER_GEN}}
+        crd rbac:roleName=smeltry-operator-role paths="./..."
+        output:crd:dir=config/crd/bases
+        output:rbac:dir=config/rbac
+
+  build:
+    desc: Compile the operator binary
+    cmds:
+      - go build -o bin/smeltry-operator ./...
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  docker-build:
+    desc: Build the operator container image
+    cmds:
+      - docker build -t {{.IMG}} .
+
+  docker-push:
+    desc: Push the operator container image
+    cmds:
+      - docker push {{.IMG}}
+
+  install:
+    desc: Install CRDs into the current cluster
+    deps: [manifests]
+    cmds:
+      - kubectl apply -f config/crd/bases/
+
+  uninstall:
+    desc: Remove CRDs from the current cluster
+    cmds:
+      - kubectl delete -f config/crd/bases/ --ignore-not-found
+
+  deploy:
+    desc: Deploy the operator into the current cluster using Kustomize
+    deps: [install]
+    cmds:
+      - kubectl apply -k config/default/
+
+  undeploy:
+    desc: Remove the operator from the current cluster
+    cmds:
+      - kubectl delete -k config/default/ --ignore-not-found

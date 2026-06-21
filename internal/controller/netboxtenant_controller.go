@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/smeltry-io/smeltry-operator/internal/config"
 	"github.com/smeltry-io/smeltry-operator/internal/netbox"
 )
 
@@ -27,7 +28,7 @@ import (
 type NetboxTenantReconciler struct {
 	client.Client
 	Scheme       *runtime.Scheme
-	NetboxClient *netbox.Client
+	NetboxHolder *config.NetboxHolder
 	// PollInterval controls how frequently Netbox is queried.
 	// Default: 5 minutes.
 	PollInterval time.Duration
@@ -39,7 +40,7 @@ func (r *NetboxTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	log := log.FromContext(ctx)
 	log.Info("syncing Netbox tenants")
 
-	tenants, err := r.NetboxClient.ListTenants(ctx)
+	tenants, err := r.NetboxHolder.Get().ListTenants(ctx)
 	if err != nil {
 		log.Error(err, "failed to list Netbox tenants")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err

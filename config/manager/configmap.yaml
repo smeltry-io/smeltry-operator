@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smeltry-operator-config
+  namespace: smeltry-system
+data:
+  # Required: base URL of your Netbox instance (no trailing slash).
+  netbox.url: "https://netbox.example.com"
+  # Optional: OTLP gRPC endpoint for distributed tracing.
+  # Leave empty to disable OpenTelemetry.
+  otel.endpoint: ""

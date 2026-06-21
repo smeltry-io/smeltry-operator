@@ -1,0 +1,3 @@
+resources: []
+# Populated by: task manifests
+# (controller-gen writes CRD YAMLs into config/crd/bases/)

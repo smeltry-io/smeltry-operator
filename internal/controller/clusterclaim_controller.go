@@ -19,29 +19,31 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	portalv1alpha1 "github.com/smeltry-io/smeltry-operator/api/v1alpha1"
+	"github.com/smeltry-io/smeltry-operator/internal/config"
 	"github.com/smeltry-io/smeltry-operator/internal/netbox"
 )
 
 const (
-	clusterClaimFinalizer   = "portal.smeltry.io/clusterclaim-protection"
-	portalSystemNamespace   = "portal-system"
-	machinecfgImage         = "ghcr.io/smeltry-io/machinecfg:latest"
-	labelAddonProfile       = "portal.smeltry.io/addon-profile"
-	labelTenant             = "portal.smeltry.io/tenant"
-	labelSite               = "portal.smeltry.io/site"
+	clusterClaimFinalizer = "portal.smeltry.io/clusterclaim-protection"
+	portalSystemNamespace = "portal-system"
+	labelAddonProfile     = "portal.smeltry.io/addon-profile"
+	labelTenant           = "portal.smeltry.io/tenant"
+	labelSite             = "portal.smeltry.io/site"
 )
 
 // ClusterClaimReconciler reconciles ClusterClaim objects.
 type ClusterClaimReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	NetboxClient  *netbox.Client
-	NetboxToken   string
-	NetboxURL     string
+	Scheme          *runtime.Scheme
+	NetboxHolder    *config.NetboxHolder
+	NetboxToken     string // kept for machinecfg Job args
+	NetboxURL       string // kept for machinecfg Job args
+	MachinecfgImage string
 }
 
 // +kubebuilder:rbac:groups=portal.smeltry.io,resources=clusterclaims,verbs=get;list;watch;create;update;patch;delete
@@ -124,7 +126,7 @@ func (r *ClusterClaimReconciler) stepValidate(ctx context.Context, cc *portalv1a
 	}
 
 	// 1c. Enough machines available in Netbox?
-	available, err := r.NetboxClient.ListAvailableDevices(ctx,
+	available, err := r.NetboxHolder.Get().ListAvailableDevices(ctx,
 		site.Spec.Netbox.SiteSlug, cc.Spec.MachineClass)
 	if err != nil {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
@@ -168,7 +170,7 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 		log.Info("step: allocate control plane IP")
 		tenantSlug := tenantFromNamespace(cc.Namespace)
 		cpDNS := fmt.Sprintf("%s-api.%s.%s", cc.Name, tenantSlug, site.Spec.DNS.Zone)
-		ip, err := r.NetboxClient.AllocateIP(ctx,
+		ip, err := r.NetboxHolder.Get().AllocateIP(ctx,
 			site.Spec.Netbox.ProvisioningPrefix, cpDNS, site.Spec.Netbox.IPAMTags)
 		if err != nil {
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
@@ -186,7 +188,7 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 		log.Info("step: allocate webhook IP")
 		tenantSlug := tenantFromNamespace(cc.Namespace)
 		whDNS := fmt.Sprintf("%s-wh.%s.%s", cc.Name, tenantSlug, site.Spec.DNS.Zone)
-		ip, err := r.NetboxClient.AllocateIP(ctx,
+		ip, err := r.NetboxHolder.Get().AllocateIP(ctx,
 			site.Spec.Netbox.ProvisioningPrefix, whDNS, site.Spec.Netbox.IPAMTags)
 		if err != nil {
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
@@ -202,7 +204,7 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 	// 2c. Allocate machines in Netbox (set status=staged).
 	if len(cc.Status.AllocatedMachineIDs) == 0 {
 		log.Info("step: allocate machines in Netbox")
-		machines, err := r.NetboxClient.ListAvailableDevices(ctx,
+		machines, err := r.NetboxHolder.Get().ListAvailableDevices(ctx,
 			site.Spec.Netbox.SiteSlug, cc.Spec.MachineClass)
 		if err != nil {
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
@@ -212,13 +214,13 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 
 		for i := 0; i < cc.Spec.MachineCount && i < len(machines); i++ {
 			m := machines[i]
-			if err := r.NetboxClient.SetDeviceStatus(ctx, m.ID, netbox.DeviceStatusStaged, tenantSlug); err != nil {
+			if err := r.NetboxHolder.Get().SetDeviceStatus(ctx, m.ID, netbox.DeviceStatusStaged, tenantSlug); err != nil {
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 			}
 			cc.Status.AllocatedMachineIDs = append(cc.Status.AllocatedMachineIDs, m.ID)
 
 			// Collect OSD disks from inventory items.
-			disks, err := r.NetboxClient.ListOSDDisks(ctx, m.ID)
+			disks, err := r.NetboxHolder.Get().ListOSDDisks(ctx, m.ID)
 			if err != nil {
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 			}
@@ -369,14 +371,14 @@ func (r *ClusterClaimReconciler) reconcileDelete(ctx context.Context, cc *portal
 
 	// Release Netbox IPAM IPs.
 	for _, id := range cc.Status.NetboxIPAMIDs {
-		if err := r.NetboxClient.ReleaseIP(ctx, id); err != nil {
+		if err := r.NetboxHolder.Get().ReleaseIP(ctx, id); err != nil {
 			log.Error(err, "failed to release Netbox IP", "id", id)
 		}
 	}
 
 	// Release machines (set status back to active).
 	for _, id := range cc.Status.AllocatedMachineIDs {
-		if err := r.NetboxClient.SetDeviceStatus(ctx, id, netbox.DeviceStatusActive, ""); err != nil {
+		if err := r.NetboxHolder.Get().SetDeviceStatus(ctx, id, netbox.DeviceStatusActive, ""); err != nil {
 			log.Error(err, "failed to release machine", "id", id)
 		}
 	}
@@ -427,7 +429,7 @@ func (r *ClusterClaimReconciler) createMachinecfgJob(ctx context.Context,
 					RestartPolicy: corev1.RestartPolicyOnFailure,
 					Containers: []corev1.Container{{
 						Name:  "machinecfg",
-						Image: machinecfgImage,
+						Image: r.MachinecfgImage,
 						Args: []string{
 							"--netbox-endpoint", r.NetboxURL,
 							"--netbox-token", r.NetboxToken,
@@ -809,11 +811,17 @@ func removeString(slice []string, s string) []string {
 	return out
 }
 
-// SetupWithManager registers the controller with the manager.
+// SetupWithManager registers the controller with the manager using default options.
 func (r *ClusterClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return r.SetupWithManagerOptions(mgr, 1)
+}
+
+// SetupWithManagerOptions registers the controller with a custom worker count.
+func (r *ClusterClaimReconciler) SetupWithManagerOptions(mgr ctrl.Manager, maxWorkers int) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&portalv1alpha1.ClusterClaim{}).
 		Owns(&batchv1.Job{}).
 		Owns(&corev1.ConfigMap{}).
+		WithOptions(ctrlconfig.Options{MaxConcurrentReconciles: maxWorkers}).
 		Complete(r)
 }

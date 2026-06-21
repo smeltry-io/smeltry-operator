@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: smeltry-operator-clusterrolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: smeltry-operator-clusterrole
+subjects:
+  - kind: ServiceAccount
+    name: smeltry-operator
+    namespace: smeltry-system

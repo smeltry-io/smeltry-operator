@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: smeltry-operator-metrics
+  namespace: smeltry-system
+  labels:
+    app.kubernetes.io/name: smeltry-operator
+    app.kubernetes.io/component: metrics
+spec:
+  selector:
+    app.kubernetes.io/name: smeltry-operator
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP

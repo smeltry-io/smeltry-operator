@@ -1,0 +1,25 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: smeltry-operator-clusterrole
+rules:
+  # CRDs cluster-scoped reads
+  - apiGroups: ["portal.smeltry.io"]
+    resources: ["addonprofiles", "siteconfigs"]
+    verbs: ["get", "list", "watch"]
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Namespaces (NetboxTenant)
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # RBAC across tenant namespaces
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # CAPI cluster-scoped objects
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["clusters", "machinedeployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

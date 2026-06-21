@@ -1,0 +1,6 @@
+namespace: smeltry-system
+
+resources:
+  - ../crd
+  - ../rbac
+  - ../manager
