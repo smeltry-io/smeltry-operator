@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,8 +12,11 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -143,7 +147,7 @@ func (r *ClusterClaimReconciler) stepValidate(ctx context.Context, cc *portalv1a
 
 	// Validation passed → move to Provisioning.
 	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseProvisioning
-	setCondition(cc, ConditionValidated, metav1.ConditionTrue, "ValidationPassed", "all checks passed")
+	setCondition(cc, portalv1alpha1.ConditionValidated, metav1.ConditionTrue, "ValidationPassed", "all checks passed")
 	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, cc)
 }
 
@@ -255,34 +259,63 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 		return r.fail(ctx, cc, "MachineCfgFailed", "machinecfg Job failed; check Job logs")
 	}
 
-	// 2e. Create Rook ConfigMap.
-	if err := r.ensureRookConfigMap(ctx, cc); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 2f. Create CAPI objects.
+	// 2e. Create CAPI objects.
 	if err := r.ensureCAPIObjects(ctx, cc, site); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	setCondition(cc, ConditionMachineCfgDone, metav1.ConditionTrue, "MachineCfgComplete", "Hardware objects created")
+	setCondition(cc, portalv1alpha1.ConditionMachineCfgDone, metav1.ConditionTrue, "MachineCfgComplete", "Hardware objects created")
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, r.Status().Update(ctx, cc)
 }
 
-// ── Step 3 : Watch CAPI + Sveltos ─────────────────────────────────────────
+// ── Step 3 : Deploy addons via capi-addon-provider ────────────────────────
 
 func (r *ClusterClaimReconciler) stepWatchAddons(ctx context.Context, cc *portalv1alpha1.ClusterClaim) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
-	log.Info("step: watch Sveltos addons")
+	log.Info("step: ensure addon HelmReleases")
 
-	// TODO: query Sveltos ClusterSummary for the tenant cluster.
-	// When the ClusterProfile matching cc.Spec.AddonProfile reports Applied:
-	//   cc.Status.Phase = AddonsReady
-	//   setCondition(cc, ConditionAddonsReady, ...)
-	//   return ctrl.Result{Requeue: true}, r.Status().Update(ctx, cc)
+	ap := &portalv1alpha1.AddonProfile{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name: cc.Spec.AddonProfile, Namespace: portalSystemNamespace,
+	}, ap); err != nil {
+		return ctrl.Result{}, err
+	}
 
-	// Placeholder: requeue and check again.
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	components := make([]portalv1alpha1.AddonComponent, len(ap.Spec.Components))
+	copy(components, ap.Spec.Components)
+	sort.Slice(components, func(i, j int) bool {
+		return components[i].Order < components[j].Order
+	})
+
+	for _, comp := range components {
+		if err := r.ensureHelmRelease(ctx, cc, comp); err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+	}
+
+	// Check readiness of all required components.
+	allReady := true
+	for _, comp := range components {
+		if !comp.Required {
+			continue
+		}
+		ready, err := r.helmReleaseReady(ctx, cc, comp.Name)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+		if !ready {
+			allReady = false
+		}
+	}
+
+	if !allReady {
+		log.Info("waiting for required HelmReleases to become ready")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseAddonsReady
+	setCondition(cc, portalv1alpha1.ConditionAddonsReady, metav1.ConditionTrue, "AllAddonsReady", "all required HelmReleases are ready")
+	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, cc)
 }
 
 // ── Step 4 : Expose kubeconfig ────────────────────────────────────────────
@@ -364,7 +397,7 @@ func (r *ClusterClaimReconciler) reconcileDelete(ctx context.Context, cc *portal
 func (r *ClusterClaimReconciler) fail(ctx context.Context, cc *portalv1alpha1.ClusterClaim, reason, msg string) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("ClusterClaim failed", "reason", reason, "msg", msg)
 	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseFailed
-	setCondition(cc, ConditionValidated, metav1.ConditionFalse, reason, msg)
+	setCondition(cc, portalv1alpha1.ConditionValidated, metav1.ConditionFalse, reason, msg)
 	return ctrl.Result{}, r.Status().Update(ctx, cc)
 }
 
@@ -406,26 +439,7 @@ func (r *ClusterClaimReconciler) createMachinecfgJob(ctx context.Context,
 	return r.Create(ctx, job)
 }
 
-func (r *ClusterClaimReconciler) ensureRookConfigMap(ctx context.Context, cc *portalv1alpha1.ClusterClaim) error {
-	if len(cc.Status.OSDDevices) == 0 {
-		return nil
-	}
-	cmName := cc.Name + "-rook-config"
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cmName,
-			Namespace: cc.Namespace,
-		},
-	}
-	_, err := ctrl.CreateOrUpdate(ctx, r.Client, cm, func() error {
-		cm.Data = map[string]string{
-			"values.yaml": buildRookValues(cc.Status.OSDDevices),
-		}
-		return controllerutil.SetControllerReference(cc, cm, r.Scheme)
-	})
-	return err
-}
-
+// buildRookValues generates inline Helm values for rook-ceph OSD configuration.
 func buildRookValues(osdDevices map[string][]string) string {
 	var sb strings.Builder
 	sb.WriteString("ceph:\n  storage:\n    nodes:\n")
@@ -440,20 +454,269 @@ func buildRookValues(osdDevices map[string][]string) string {
 
 func (r *ClusterClaimReconciler) ensureCAPIObjects(ctx context.Context,
 	cc *portalv1alpha1.ClusterClaim, site *portalv1alpha1.SiteConfig) error {
-	// TODO: create CAPI Cluster + TinkerbellCluster + TenantControlPlane (Kamaji)
-	// + TinkerbellMachineTemplate + MachineDeployment.
-	//
-	// Key values from status:
-	//   controlPlaneIP    → TenantControlPlane.spec.controlPlane.endpoint.host
-	//   site.Spec.Cilium.L2PoolName → annotation on control plane Service
-	//
-	// Labels to set on Cluster:
-	//   portal.smeltry.io/tenant        = tenantFromNamespace(cc.Namespace)
-	//   portal.smeltry.io/site          = cc.Spec.Site
-	//   portal.smeltry.io/addon-profile = cc.Spec.AddonProfile
-	//
-	// This drives Sveltos ClusterProfile selection automatically.
+
+	tcpName := cc.Name + "-control-plane"
+	infraName := cc.Name + "-infra"
+	machineTemplateName := cc.Name + "-mt"
+
+	// a. TenantControlPlane (Kamaji) — unstructured.
+	tcp := &unstructured.Unstructured{}
+	tcp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "kamaji.clastix.io",
+		Version: "v1alpha1",
+		Kind:    "TenantControlPlane",
+	})
+	tcp.SetName(tcpName)
+	tcp.SetNamespace(cc.Namespace)
+	if err := ctrl.SetControllerReference(cc, tcp, r.Scheme); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(tcp.Object, map[string]interface{}{
+		"endpoint": map[string]interface{}{
+			"host": cc.Status.ControlPlaneIP,
+			"port": int64(6443),
+		},
+	}, "spec", "controlPlane"); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(tcp.Object, []interface{}{
+		map[string]interface{}{"name": "--oidc-issuer-url", "value": site.Spec.OIDC.IssuerURL},
+		map[string]interface{}{"name": "--oidc-client-id", "value": site.Spec.OIDC.ClientID},
+		map[string]interface{}{"name": "--oidc-username-claim", "value": site.Spec.OIDC.UsernameClaim},
+		map[string]interface{}{"name": "--oidc-groups-claim", "value": site.Spec.OIDC.GroupsClaim},
+	}, "spec", "addons", "apiServerArguments"); err != nil {
+		return err
+	}
+	if err := r.applyUnstructured(ctx, tcp); err != nil {
+		return fmt.Errorf("TenantControlPlane: %w", err)
+	}
+
+	// b. TinkerbellCluster (CAPT) — unstructured.
+	tbCluster := &unstructured.Unstructured{}
+	tbCluster.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "TinkerbellCluster",
+	})
+	tbCluster.SetName(infraName)
+	tbCluster.SetNamespace(cc.Namespace)
+	if err := ctrl.SetControllerReference(cc, tbCluster, r.Scheme); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(tbCluster.Object, map[string]interface{}{
+		"host": cc.Status.ControlPlaneIP,
+		"port": int64(6443),
+	}, "spec", "controlPlaneEndpoint"); err != nil {
+		return err
+	}
+	if err := r.applyUnstructured(ctx, tbCluster); err != nil {
+		return fmt.Errorf("TinkerbellCluster: %w", err)
+	}
+
+	// c. CAPI Cluster (typed).
+	tenantSlug := tenantFromNamespace(cc.Namespace)
+	capiCluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cc.Name,
+			Namespace: cc.Namespace,
+			Labels: map[string]string{
+				labelTenant:       tenantSlug,
+				labelSite:         cc.Spec.Site,
+				labelAddonProfile: cc.Spec.AddonProfile,
+				"cluster-api.cattle.io/rancher-auto-import": "true",
+			},
+		},
+	}
+	if err := ctrl.SetControllerReference(cc, capiCluster, r.Scheme); err != nil {
+		return err
+	}
+	_, err := ctrl.CreateOrUpdate(ctx, r.Client, capiCluster, func() error {
+		capiCluster.Spec.InfrastructureRef = &corev1.ObjectReference{
+			APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+			Kind:       "TinkerbellCluster",
+			Name:       infraName,
+			Namespace:  cc.Namespace,
+		}
+		capiCluster.Spec.ControlPlaneRef = &corev1.ObjectReference{
+			APIVersion: "kamaji.clastix.io/v1alpha1",
+			Kind:       "TenantControlPlane",
+			Name:       tcpName,
+			Namespace:  cc.Namespace,
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("Cluster: %w", err)
+	}
+
+	// d. TinkerbellMachineTemplate — unstructured.
+	tbMT := &unstructured.Unstructured{}
+	tbMT.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "TinkerbellMachineTemplate",
+	})
+	tbMT.SetName(machineTemplateName)
+	tbMT.SetNamespace(cc.Namespace)
+	if err := ctrl.SetControllerReference(cc, tbMT, r.Scheme); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(tbMT.Object, map[string]interface{}{}, "spec", "template", "spec"); err != nil {
+		return err
+	}
+	if err := r.applyUnstructured(ctx, tbMT); err != nil {
+		return fmt.Errorf("TinkerbellMachineTemplate: %w", err)
+	}
+
+	// e. MachineDeployment (CAPI typed).
+	replicas := int32(cc.Spec.MachineCount)
+	md := &clusterv1.MachineDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cc.Name + "-md",
+			Namespace: cc.Namespace,
+		},
+	}
+	if err := ctrl.SetControllerReference(cc, md, r.Scheme); err != nil {
+		return err
+	}
+	_, err = ctrl.CreateOrUpdate(ctx, r.Client, md, func() error {
+		md.Spec.ClusterName = cc.Name
+		md.Spec.Replicas = &replicas
+		md.Spec.Template.Spec.ClusterName = cc.Name
+		md.Spec.Template.Spec.InfrastructureRef = corev1.ObjectReference{
+			APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+			Kind:       "TinkerbellMachineTemplate",
+			Name:       machineTemplateName,
+			Namespace:  cc.Namespace,
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("MachineDeployment: %w", err)
+	}
+
+	// f. LoadBalancer Service for TenantControlPlane.
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tcpName + "-lb",
+			Namespace: cc.Namespace,
+		},
+	}
+	if err := ctrl.SetControllerReference(cc, svc, r.Scheme); err != nil {
+		return err
+	}
+	_, err = ctrl.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.Annotations = map[string]string{
+			"io.cilium/lb-ipam-ips":           cc.Status.ControlPlaneIP,
+			"io.cilium/lb-ipam-pool":          site.Spec.Cilium.L2PoolName,
+		}
+		svc.Spec.Type = corev1.ServiceTypeLoadBalancer
+		svc.Spec.Selector = map[string]string{
+			"kamaji.clastix.io/name": tcpName,
+		}
+		svc.Spec.Ports = []corev1.ServicePort{{
+			Name:     "apiserver",
+			Port:     6443,
+			Protocol: corev1.ProtocolTCP,
+		}}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("LoadBalancer Service: %w", err)
+	}
+
+	// Update ClusterRef.
+	if cc.Status.ClusterRef == nil {
+		cc.Status.ClusterRef = &portalv1alpha1.LocalObjectRef{}
+	}
+	cc.Status.ClusterRef.Name = cc.Name
+
+	// Check if CAPI Cluster control plane is ready; caller handles status update.
+	existing := &clusterv1.Cluster{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cc.Name, Namespace: cc.Namespace}, existing); err != nil {
+		return err
+	}
+	if existing.Status.ControlPlaneReady {
+		cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseClusterReady
+		setCondition(cc, portalv1alpha1.ConditionCAPIReady, metav1.ConditionTrue, "ControlPlaneReady", "CAPI cluster control plane is ready")
+	}
+
 	return nil
+}
+
+// applyUnstructured creates the object if it does not exist, and skips update if it already does.
+func (r *ClusterClaimReconciler) applyUnstructured(ctx context.Context, obj *unstructured.Unstructured) error {
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(obj.GroupVersionKind())
+	err := r.Get(ctx, types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}, existing)
+	if errors.IsNotFound(err) {
+		return r.Create(ctx, obj)
+	}
+	return err
+}
+
+// ensureHelmRelease creates or updates a capi-addon-provider HelmRelease for one AddonComponent.
+func (r *ClusterClaimReconciler) ensureHelmRelease(ctx context.Context,
+	cc *portalv1alpha1.ClusterClaim, comp portalv1alpha1.AddonComponent) error {
+
+	values := comp.HelmRef.Values
+	if comp.Name == "rook-ceph" && len(cc.Status.OSDDevices) > 0 {
+		values = values + "\n" + buildRookValues(cc.Status.OSDDevices)
+	}
+
+	hr := &unstructured.Unstructured{}
+	hr.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "addons.stackhpc.com",
+		Version: "v1alpha1",
+		Kind:    "HelmRelease",
+	})
+	hr.SetName(cc.Name + "-" + comp.Name)
+	hr.SetNamespace(cc.Namespace)
+	if err := ctrl.SetControllerReference(cc, hr, r.Scheme); err != nil {
+		return err
+	}
+
+	bootstrap := comp.Order == 1
+	if err := unstructured.SetNestedField(hr.Object, cc.Name, "spec", "clusterName"); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(hr.Object, comp.HelmRef.RepoURL, "spec", "chart", "repo"); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(hr.Object, comp.HelmRef.ChartName, "spec", "chart", "name"); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(hr.Object, comp.HelmRef.ChartVersion, "spec", "chart", "version"); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(hr.Object, values, "spec", "values"); err != nil {
+		return err
+	}
+	if err := unstructured.SetNestedField(hr.Object, bootstrap, "spec", "bootstrap"); err != nil {
+		return err
+	}
+
+	return r.applyUnstructured(ctx, hr)
+}
+
+// helmReleaseReady returns true when the HelmRelease for the given component reports ready.
+func (r *ClusterClaimReconciler) helmReleaseReady(ctx context.Context,
+	cc *portalv1alpha1.ClusterClaim, componentName string) (bool, error) {
+
+	hr := &unstructured.Unstructured{}
+	hr.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "addons.stackhpc.com",
+		Version: "v1alpha1",
+		Kind:    "HelmRelease",
+	})
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      cc.Name + "-" + componentName,
+		Namespace: cc.Namespace,
+	}, hr); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	ready, _, _ := unstructured.NestedBool(hr.Object, "status", "ready")
+	return ready, nil
 }
 
 // ── Condition helpers ──────────────────────────────────────────────────────

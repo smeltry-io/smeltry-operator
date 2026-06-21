@@ -1,5 +1,6 @@
 // Package v1alpha1 contains API Schema definitions for the portal.smeltry.io API group.
 // +groupName=portal.smeltry.io
+// +kubebuilder:object:generate=true
 package v1alpha1
 
 import (
