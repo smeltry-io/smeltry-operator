@@ -562,7 +562,6 @@ func readyHelmRelease(clusterName, componentName, namespace string) *unstructure
 	hr.SetGroupVersionKind(helmReleaseGVK)
 	hr.SetName(clusterName + "-" + componentName)
 	hr.SetNamespace(namespace)
-	hr.SetResourceVersion("1")
 	_ = unstructured.SetNestedField(hr.Object, true, "status", "ready")
 	return hr
 }
@@ -707,8 +706,10 @@ func TestClusterClaim_StepWatchAddons_InjectsOSDValues(t *testing.T) {
 		t.Fatalf("rook-ceph HelmRelease not found: %v", err)
 	}
 	values, _, _ := unstructured.NestedString(hr.Object, "spec", "values")
-	if !strings.Contains(values, "sdb") {
-		t.Errorf("expected spec.values to contain OSD disk 'sdb', got: %q", values)
+	for _, want := range []string{"sdb", "sdc", "100"} {
+		if !strings.Contains(values, want) {
+			t.Errorf("expected spec.values to contain %q (OSD config), got: %q", want, values)
+		}
 	}
 }
 
