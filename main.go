@@ -70,6 +70,9 @@ func main() {
 		"How often to poll Netbox for tenant changes.")
 	flag.StringVar(&machinecfgImage, "machinecfg-image", "ghcr.io/smeltry-io/machinecfg:latest",
 		"Container image for the machinecfg Job.")
+	var auditTTL string
+	flag.StringVar(&auditTTL, "audit-ttl", "720h",
+		"Default TTL for AuditEvent objects (Go duration, e.g. '720h' = 30 days).")
 	flag.Parse()
 
 	// ── Logging (slog JSON) ────────────────────────────────────────────────
@@ -159,12 +162,13 @@ func main() {
 
 	// ── Controllers ───────────────────────────────────────────────────────
 	if err := (&controller.ClusterClaimReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		NetboxHolder: nbHolder,
-		NetboxToken:  netboxToken,
-		NetboxURL:    netboxURL,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		NetboxHolder:    nbHolder,
+		NetboxToken:     netboxToken,
+		NetboxURL:       netboxURL,
 		MachinecfgImage: machinecfgImage,
+		DefaultAuditTTL: auditTTL,
 	}).SetupWithManagerOptions(mgr, maxWorkers); err != nil {
 		setupLog.Error(err, "unable to create ClusterClaim controller")
 		os.Exit(1)
@@ -177,6 +181,21 @@ func main() {
 		PollInterval: netboxPollInterval,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create NetboxTenant controller")
+		os.Exit(1)
+	}
+
+	if err := (&controller.AuditEventPurgeReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		DefaultTTL: func() time.Duration {
+			d, err := time.ParseDuration(auditTTL)
+			if err != nil {
+				return 720 * time.Hour
+			}
+			return d
+		}(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create AuditEventPurge controller")
 		os.Exit(1)
 	}
 

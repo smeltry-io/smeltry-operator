@@ -44,6 +44,7 @@ type ClusterClaimReconciler struct {
 	NetboxToken     string // kept for machinecfg Job args
 	NetboxURL       string // kept for machinecfg Job args
 	MachinecfgImage string
+	DefaultAuditTTL string // Go duration string, e.g. "720h"; used for AuditEvent TTL
 }
 
 // +kubebuilder:rbac:groups=portal.smeltry.io,resources=clusterclaims,verbs=get;list;watch;create;update;patch;delete
@@ -147,9 +148,20 @@ func (r *ClusterClaimReconciler) stepValidate(ctx context.Context, cc *portalv1a
 	}
 
 	// Validation passed → move to Provisioning.
+	oldPhase := string(cc.Status.Phase)
 	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseProvisioning
 	setCondition(cc, portalv1alpha1.ConditionValidated, metav1.ConditionTrue, "ValidationPassed", "all checks passed")
-	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, cc)
+	if err := r.Status().Update(ctx, cc); err != nil {
+		return ctrl.Result{}, err
+	}
+	emitAuditEvent(ctx, r.Client, cc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
+		Type:         portalv1alpha1.AuditTypePhaseChanged,
+		ResourceKind: "ClusterClaim",
+		ResourceName: cc.Name,
+		OldPhase:     oldPhase,
+		NewPhase:     string(portalv1alpha1.ClusterClaimPhaseProvisioning),
+	})
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // ── Step 2 : Provision (IPs → machines → machinecfg Job → CAPI objects) ──
@@ -217,6 +229,12 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 			}
 			cc.Status.AllocatedMachineIDs = append(cc.Status.AllocatedMachineIDs, m.ID)
+			emitAuditEvent(ctx, r.Client, cc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
+				Type:         portalv1alpha1.AuditTypeMachineAlloced,
+				ResourceKind: "ClusterClaim",
+				ResourceName: cc.Name,
+				MachineID:    m.ID,
+			})
 
 			// Collect OSD disks from inventory items.
 			disks, err := r.NetboxHolder.Get().ListOSDDisks(ctx, m.ID)
@@ -485,6 +503,12 @@ func (r *ClusterClaimReconciler) reconcileDelete(ctx context.Context, cc *portal
 
 	// CAPI objects are deleted by ownerReference cascade.
 	// machinecfg will delete Hardware objects when machines leave staged status.
+
+	emitAuditEvent(ctx, r.Client, cc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
+		Type:         portalv1alpha1.AuditTypeClusterDeleted,
+		ResourceKind: "ClusterClaim",
+		ResourceName: cc.Name,
+	})
 
 	controllerutil.RemoveFinalizer(cc, clusterClaimFinalizer)
 	return ctrl.Result{}, r.Update(ctx, cc)
