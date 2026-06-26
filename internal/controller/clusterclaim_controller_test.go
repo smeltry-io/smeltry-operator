@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -542,6 +543,179 @@ func TestClusterClaim_Finalizer_RemovesProtectionFinalizer(t *testing.T) {
 // rook-ceph HelmRelease. The fake Netbox client supports OSDDisks via its OSDDisks
 // map — a dedicated test should seed nb.OSDDisks and assert status.OSDDevices after
 // reconcileCC. Tracked as a follow-up to the stepWatchAddons testing story.
+
+// ── Ready phase: scale up / scale down / grace period ────────────────────────
+
+// newReadyCC creates a ClusterClaim in phase Ready with pre-allocated machines.
+// machineIDs must be coherent with spec.machineCount.
+func newReadyCC(name, namespace string, machineIDs []int) *portalv1alpha1.ClusterClaim {
+	cc := newCC(name, namespace)
+	cc.Spec.MachineCount = len(machineIDs)
+	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseReady
+	cc.Status.ControlPlaneIP = "10.0.1.1"
+	cc.Status.WebhookIP = "10.0.1.2"
+	cc.Status.NetboxIPAMIDs = []int{1, 2}
+	cc.Status.AllocatedMachineIDs = machineIDs
+	cc.Status.KubeconfigSecret = name + "-kubeconfig"
+	return cc
+}
+
+func TestClusterClaim_ScaleUp_AllocatesNewMachines(t *testing.T) {
+	// Cluster starts with 2 machines; user requests 3.
+	cc := newReadyCC("ml-train", "tenant-acme", []int{100, 101})
+	cc.Spec.MachineCount = 3 // desired: 1 more than allocated
+
+	nb := netboxfake.New()
+	// A third machine is available for allocation.
+	extra := netbox.Device{ID: 102}
+	extra.Status.Value = netbox.DeviceStatusActive
+	extra.DeviceType.Model = "standard"
+	nb.Devices = []netbox.Device{extra}
+
+	r := newCCReconciler(t, nb, cc, defaultSiteConfig())
+	reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	if len(got.Status.AllocatedMachineIDs) != 3 {
+		t.Errorf("AllocatedMachineIDs = %v, want 3 entries after scale up", got.Status.AllocatedMachineIDs)
+	}
+	if nb.DeviceStatuses[102] != netbox.DeviceStatusStaged {
+		t.Errorf("new machine status = %q, want staged", nb.DeviceStatuses[102])
+	}
+}
+
+func TestClusterClaim_ScaleUp_InsufficientMachines_SetsCondition(t *testing.T) {
+	// Cluster has 2 machines; user wants 4, but only 1 extra is available.
+	cc := newReadyCC("ml-train", "tenant-acme", []int{100, 101})
+	cc.Spec.MachineCount = 4
+
+	nb := netboxfake.New()
+	extra := netbox.Device{ID: 102}
+	extra.Status.Value = netbox.DeviceStatusActive
+	extra.DeviceType.Model = "standard"
+	nb.Devices = []netbox.Device{extra} // only 1 available, need 2 more
+
+	r := newCCReconciler(t, nb, cc, defaultSiteConfig())
+	reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	if got.Status.Phase != portalv1alpha1.ClusterClaimPhaseReady {
+		t.Errorf("phase = %q, want Ready (still waiting for machines)", got.Status.Phase)
+	}
+	found := false
+	for _, cond := range got.Status.Conditions {
+		if cond.Type == "ScaleUpBlocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected condition ScaleUpBlocked to be set")
+	}
+}
+
+func TestClusterClaim_ScaleDown_WithoutCeph_ReleasesMachines(t *testing.T) {
+	// Cluster has 3 machines; user reduces to 2.
+	cc := newReadyCC("ml-train", "tenant-acme", []int{100, 101, 102})
+	cc.Spec.MachineCount = 2
+
+	nb := netboxfake.New()
+	for _, id := range []int{100, 101, 102} {
+		d := netbox.Device{ID: id}
+		d.Status.Value = netbox.DeviceStatusStaged
+		d.DeviceType.Model = "standard"
+		nb.Devices = append(nb.Devices, d)
+	}
+
+	// AddonProfile without rook-ceph → scale down allowed.
+	r := newCCReconciler(t, nb, cc, defaultSiteConfig(), defaultAddonProfile())
+	reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	if len(got.Status.AllocatedMachineIDs) != 2 {
+		t.Errorf("AllocatedMachineIDs = %v, want 2 entries after scale down", got.Status.AllocatedMachineIDs)
+	}
+	if nb.DeviceStatuses[102] != netbox.DeviceStatusActive {
+		t.Errorf("released machine status = %q, want active", nb.DeviceStatuses[102])
+	}
+}
+
+func TestClusterClaim_ScaleDown_WithCeph_SetsBlockedCondition(t *testing.T) {
+	cc := newReadyCC("ml-train", "tenant-acme", []int{100, 101, 102})
+	cc.Spec.MachineCount = 2
+
+	// AddonProfile includes rook-ceph — scale down must be blocked.
+	ap := defaultAddonProfile()
+	ap.Spec.Components = append(ap.Spec.Components, portalv1alpha1.AddonComponent{
+		Name: "rook-ceph", Required: false, Order: 3,
+	})
+
+	nb := netboxfake.New()
+	r := newCCReconciler(t, nb, cc, defaultSiteConfig(), ap)
+	reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	found := false
+	for _, cond := range got.Status.Conditions {
+		if cond.Type == "ScaleDownBlocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected condition ScaleDownBlocked when rook-ceph is present")
+	}
+	// Machines must not have been released.
+	if len(got.Status.AllocatedMachineIDs) != 3 {
+		t.Errorf("AllocatedMachineIDs = %v, want 3 (unchanged)", got.Status.AllocatedMachineIDs)
+	}
+}
+
+func TestClusterClaim_GracePeriod_FutureAnnotation_NoDelete(t *testing.T) {
+	cc := newReadyCC("ml-train", "tenant-acme", []int{100, 101})
+	// Deletion scheduled 1 hour from now — should NOT trigger deletion yet.
+	cc.Annotations = map[string]string{
+		"portal.smeltry.io/delete-at": metav1.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}
+
+	r := newCCReconciler(t, netboxfake.New(), cc)
+	reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	if !got.DeletionTimestamp.IsZero() {
+		t.Error("DeletionTimestamp should NOT be set before grace period expires")
+	}
+}
+
+func TestClusterClaim_GracePeriod_ExpiredAnnotation_TriggersDeletion(t *testing.T) {
+	cc := newReadyCC("ml-train", "tenant-acme", []int{100, 101})
+	cc.Status.NetboxIPAMIDs = []int{10, 11}
+	// Delete-at is in the past — deletion must be triggered immediately.
+	cc.Annotations = map[string]string{
+		"portal.smeltry.io/delete-at": metav1.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+	}
+
+	nb := netboxfake.New()
+	for _, id := range []int{100, 101} {
+		d := netbox.Device{ID: id}
+		d.Status.Value = netbox.DeviceStatusStaged
+		d.DeviceType.Model = "standard"
+		nb.Devices = append(nb.Devices, d)
+	}
+
+	r := newCCReconciler(t, nb, cc)
+
+	// First reconcile: detects expired annotation → triggers Delete.
+	reconcileCC(t, r, cc)
+	got := getCC(t, r, cc)
+	if got.DeletionTimestamp.IsZero() {
+		t.Fatal("DeletionTimestamp should be set after grace period expires")
+	}
+
+	// Second reconcile: finalizer runs → resources released.
+	reconcileCC(t, r, cc)
+	if len(nb.ReleasedIPs) == 0 {
+		t.Error("expected IPs to be released after finalizer ran")
+	}
+}
 
 func TestClusterClaim_Idempotent_NoDoubleIPAllocation(t *testing.T) {
 	cc := newProvisioningCC("ml-train", "tenant-acme")
