@@ -544,6 +544,9 @@ var helmReleaseGVK = schema.GroupVersionKind{
 }
 
 // newClusterReadyCC creates a ClusterClaim pre-positioned in phase ClusterReady.
+// AllocatedMachineIDs and NetboxIPAMIDs are pre-seeded to represent a realistic
+// state; stepWatchAddons itself makes no Netbox calls, so their exact values do
+// not affect these tests.
 func newClusterReadyCC(name, namespace string) *portalv1alpha1.ClusterClaim {
 	cc := newCC(name, namespace)
 	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseClusterReady
@@ -581,7 +584,9 @@ func TestClusterClaim_StepWatchAddons_TransitionsToAddonsReady(t *testing.T) {
 	}
 }
 
-// Story 5.1 — A HelmRelease is created for each addon component in the AddonProfile.
+// Story 5.1 — A HelmRelease is created for each addon component in the AddonProfile,
+// with spec.clusterName set to the ClusterClaim name so capi-addon-provider targets
+// the right CAPI cluster.
 func TestClusterClaim_StepWatchAddons_CreatesHelmReleases(t *testing.T) {
 	cc := newClusterReadyCC("ml-train", "tenant-acme")
 	r := newCCReconciler(t, netboxfake.New(), cc, defaultAddonProfile())
@@ -594,6 +599,10 @@ func TestClusterClaim_StepWatchAddons_CreatesHelmReleases(t *testing.T) {
 		Name: "ml-train-cilium", Namespace: "tenant-acme",
 	}, hr); err != nil {
 		t.Fatalf("HelmRelease ml-train-cilium not found: %v", err)
+	}
+	clusterName, _, _ := unstructured.NestedString(hr.Object, "spec", "clusterName")
+	if clusterName != "ml-train" {
+		t.Errorf("spec.clusterName = %q, want %q", clusterName, "ml-train")
 	}
 }
 
