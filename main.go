@@ -29,6 +29,7 @@ import (
 	"github.com/smeltry-io/smeltry-operator/internal/controller"
 	"github.com/smeltry-io/smeltry-operator/internal/metrics"
 	"github.com/smeltry-io/smeltry-operator/internal/netbox"
+	internalrbac "github.com/smeltry-io/smeltry-operator/internal/rbac"
 	"github.com/smeltry-io/smeltry-operator/internal/telemetry"
 )
 
@@ -149,6 +150,12 @@ func main() {
 
 	// ── MaxConcurrentReconciles (autotune) ────────────────────────────────
 	maxWorkers := max(1, runtime.GOMAXPROCS(0))
+
+	// ── Cluster-scoped RBAC (idempotent, runs at every startup) ──────────
+	if err := internalrbac.EnsureClusterRBAC(ctx, k8sClient); err != nil {
+		setupLog.Error(err, "unable to ensure cluster RBAC")
+		os.Exit(1)
+	}
 
 	// ── Controllers ───────────────────────────────────────────────────────
 	if err := (&controller.ClusterClaimReconciler{
