@@ -23,6 +23,7 @@ jobs:
 
   build:
     name: Build and push image
+    needs: [test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,16 +64,11 @@ jobs:
           fetch-depth: 0
       - name: Check Signed-off-by on all commits in PR
         run: |
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
-          # On push to main, only check the latest commit
-          if [ -z "$BASE" ]; then
-            BASE="HEAD~1"
-            HEAD="HEAD"
-          fi
-          MISSING=$(git log "${BASE}..${HEAD}" --format="%H %s" | while read sha subject; do
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          HEAD="${{ github.event.pull_request.head.sha || github.sha }}"
+          MISSING=$(git log "${BASE}..${HEAD}" --format="%H" | while read sha; do
             if ! git log -1 --format="%B" "$sha" | grep -q "^Signed-off-by:"; then
-              echo "  $sha $subject"
+              echo "  $sha $(git log -1 --format='%s' "$sha")"
             fi
           done)
           if [ -n "$MISSING" ]; then

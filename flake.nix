@@ -17,9 +17,6 @@
           version = self.shortRev or "dev";
           src = ./.;
           vendorHash = null; # set after first `nix build` with `go mod vendor`
-          # CGO_ENABLED is already 0 by default in buildGoModule; setting it
-          # as a top-level derivation arg conflicts with newer nixpkgs env handling.
-          env.CGO_ENABLED = "0";
           ldflags = [
             "-s" "-w"
             "-extldflags=-static"
