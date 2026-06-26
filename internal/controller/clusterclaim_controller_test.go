@@ -5,11 +5,14 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
+
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -108,7 +111,7 @@ func defaultAddonProfile() *portalv1alpha1.AddonProfile {
 func defaultDevices(count int) []netbox.Device {
 	var out []netbox.Device
 	for i := 0; i < count; i++ {
-		d := netbox.Device{ID: 100 + i, Name: "node-0" + string(rune('0'+i))}
+		d := netbox.Device{ID: 100 + i, Name: fmt.Sprintf("node-%02d", i)}
 		d.Status.Value = netbox.DeviceStatusActive
 		d.DeviceType.Model = "standard"
 		out = append(out, d)
@@ -221,6 +224,8 @@ func TestClusterClaim_AllocatesWebhookIP(t *testing.T) {
 	r := newCCReconciler(t, nb, cc, defaultSiteConfig())
 
 	// Two reconcile passes: first sets CP IP, second sets webhook IP.
+	// getCC between passes is required to refresh the resourceVersion so the
+	// second status update does not conflict with the first.
 	reconcileCC(t, r, cc)
 	cc = getCC(t, r, cc)
 	reconcileCC(t, r, cc)
@@ -419,7 +424,9 @@ func deletedCC(name, namespace string) *portalv1alpha1.ClusterClaim {
 func TestClusterClaim_Finalizer_ReleasesIPs(t *testing.T) {
 	cc := deletedCC("ml-train", "tenant-acme")
 	nb := netboxfake.New()
-	// IDs 100, 101 must exist for SetDeviceStatus to work.
+	// The finalizer calls both ReleaseIP and SetDeviceStatus in sequence.
+	// Devices 100/101 must exist so SetDeviceStatus does not error out before
+	// we can verify that IPs 10/11 (from NetboxIPAMIDs) were released.
 	nb.Devices = defaultDevices(2)
 	nb.Devices[0].ID = 100
 	nb.Devices[1].ID = 101
@@ -505,19 +512,36 @@ func TestClusterClaim_Finalizer_RemovesProtectionFinalizer(t *testing.T) {
 
 	reconcileCC(t, r, cc)
 
-	// After finalizer removal + empty DeletionTimestamp, the fake client deletes
-	// the object — not-found means the finalizer was removed successfully.
+	// The fake client garbage-collects the object once its finalizer list is empty
+	// and a DeletionTimestamp is set. Both outcomes are valid: the object is gone
+	// (not-found) or still present without the protection finalizer.
 	got := &portalv1alpha1.ClusterClaim{}
 	err := r.Get(context.Background(), types.NamespacedName{Name: cc.Name, Namespace: cc.Namespace}, got)
-	if err == nil {
-		for _, f := range got.Finalizers {
-			if f == clusterClaimFinalizer {
-				t.Error("protection finalizer should have been removed after cleanup")
-			}
+	if k8serrors.IsNotFound(err) {
+		return // object fully cleaned up — finalizer was removed
+	}
+	if err != nil {
+		t.Fatalf("unexpected Get error: %v", err)
+	}
+	for _, f := range got.Finalizers {
+		if f == clusterClaimFinalizer {
+			t.Error("protection finalizer should have been removed after cleanup")
 		}
 	}
-	// not-found is also acceptable (object fully cleaned up)
 }
+
+// NOT TESTED: stepWatchAddons (phase ClusterReady → AddonsReady).
+// This step creates HelmRelease objects (addons.stackhpc.com/v1alpha1, unstructured)
+// and polls their status.ready field. Testing it requires either registering the
+// capi-addon-provider CRD scheme in the fake client or introducing a seam to inject
+// ready status — both add significant complexity. Covered by e2e / manual validation.
+
+// NOT TESTED: OSD disk collection (status.OSDDevices).
+// stepProvision calls ListOSDDisks for each allocated machine and stores the result
+// in status.OSDDevices, which is then injected as inline Helm values into the
+// rook-ceph HelmRelease. The fake Netbox client supports OSDDisks via its OSDDisks
+// map — a dedicated test should seed nb.OSDDisks and assert status.OSDDevices after
+// reconcileCC. Tracked as a follow-up to the stepWatchAddons testing story.
 
 func TestClusterClaim_Idempotent_NoDoubleIPAllocation(t *testing.T) {
 	cc := newProvisioningCC("ml-train", "tenant-acme")
