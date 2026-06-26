@@ -14,23 +14,23 @@ import (
 // take effect without restarting the controller.
 type NetboxHolder struct {
 	mu     sync.RWMutex
-	client *netbox.Client
+	client netbox.ClientIface
 }
 
 // NewNetboxHolder returns a holder pre-initialised with the given client.
-func NewNetboxHolder(c *netbox.Client) *NetboxHolder {
+func NewNetboxHolder(c netbox.ClientIface) *NetboxHolder {
 	return &NetboxHolder{client: c}
 }
 
 // Get returns the current Netbox client. Safe for concurrent use.
-func (h *NetboxHolder) Get() *netbox.Client {
+func (h *NetboxHolder) Get() netbox.ClientIface {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.client
 }
 
 // Set atomically replaces the Netbox client. Safe for concurrent use.
-func (h *NetboxHolder) Set(c *netbox.Client) {
+func (h *NetboxHolder) Set(c netbox.ClientIface) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.client = c
