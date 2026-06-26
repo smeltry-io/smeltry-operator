@@ -1,5 +1,5 @@
 # Build stage — used when building without Nix (e.g. contributors without Nix)
-FROM golang:1.22 AS build
+FROM golang:1.25 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

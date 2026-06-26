@@ -17,7 +17,6 @@
           version = self.shortRev or "dev";
           src = ./.;
           vendorHash = null; # set after first `nix build` with `go mod vendor`
-          CGO_ENABLED = "0";
           ldflags = [
             "-s" "-w"
             "-extldflags=-static"
@@ -27,9 +26,10 @@
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            go_1_22
+            go # tracks the current stable Go in nixpkgs (go_1_22 was removed)
             golangci-lint
-            controller-gen
+            # controller-gen is not a top-level nixpkgs package;
+            # use `task tools` to download it via go install (see Taskfile.yaml)
             kubectl
             kubernetes-helm
           ];
