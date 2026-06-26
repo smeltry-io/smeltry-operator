@@ -6,15 +6,18 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -531,11 +534,193 @@ func TestClusterClaim_Finalizer_RemovesProtectionFinalizer(t *testing.T) {
 	}
 }
 
-// NOT TESTED: stepWatchAddons (phase ClusterReady → AddonsReady).
-// This step creates HelmRelease objects (addons.stackhpc.com/v1alpha1, unstructured)
-// and polls their status.ready field. Testing it requires either registering the
-// capi-addon-provider CRD scheme in the fake client or introducing a seam to inject
-// ready status — both add significant complexity. Covered by e2e / manual validation.
+// ── StepWatchAddons (phase ClusterReady → AddonsReady) — Epic 5 ──────────────
+
+// helmReleaseGVK is the GroupVersionKind used by capi-addon-provider HelmRelease objects.
+var helmReleaseGVK = schema.GroupVersionKind{
+	Group:   "addons.stackhpc.com",
+	Version: "v1alpha1",
+	Kind:    "HelmRelease",
+}
+
+// newClusterReadyCC creates a ClusterClaim pre-positioned in phase ClusterReady.
+// AllocatedMachineIDs and NetboxIPAMIDs are pre-seeded to represent a realistic
+// state; stepWatchAddons itself makes no Netbox calls, so their exact values do
+// not affect these tests.
+func newClusterReadyCC(name, namespace string) *portalv1alpha1.ClusterClaim {
+	cc := newCC(name, namespace)
+	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseClusterReady
+	cc.Status.ControlPlaneIP = "10.0.1.1"
+	cc.Status.WebhookIP = "10.0.1.2"
+	cc.Status.NetboxIPAMIDs = []int{1, 2}
+	cc.Status.AllocatedMachineIDs = []int{100, 101}
+	return cc
+}
+
+// readyHelmRelease builds a pre-seeded HelmRelease unstructured object with status.ready=true.
+// Since HelmRelease is not registered in WithStatusSubresource, the fake client stores the
+// full object (including status) and Get returns it unchanged — no status/spec split applies.
+func readyHelmRelease(clusterName, componentName, namespace string) *unstructured.Unstructured {
+	hr := &unstructured.Unstructured{}
+	hr.SetGroupVersionKind(helmReleaseGVK)
+	hr.SetName(clusterName + "-" + componentName)
+	hr.SetNamespace(namespace)
+	_ = unstructured.SetNestedField(hr.Object, true, "status", "ready")
+	return hr
+}
+
+// Story 5.4 — All required HelmReleases ready → phase transitions to AddonsReady.
+func TestClusterClaim_StepWatchAddons_TransitionsToAddonsReady(t *testing.T) {
+	cc := newClusterReadyCC("ml-train", "tenant-acme")
+	// defaultAddonProfile has cilium (required=true, order=1); pre-seed it as ready.
+	hr := readyHelmRelease("ml-train", "cilium", "tenant-acme")
+	r := newCCReconciler(t, netboxfake.New(), cc, defaultAddonProfile(), hr)
+
+	reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	if got.Status.Phase != portalv1alpha1.ClusterClaimPhaseAddonsReady {
+		t.Errorf("phase = %q, want AddonsReady", got.Status.Phase)
+	}
+}
+
+// Story 5.1 — A HelmRelease is created for each addon component in the AddonProfile,
+// with spec.clusterName set to the ClusterClaim name so capi-addon-provider targets
+// the right CAPI cluster.
+func TestClusterClaim_StepWatchAddons_CreatesHelmReleases(t *testing.T) {
+	cc := newClusterReadyCC("ml-train", "tenant-acme")
+	r := newCCReconciler(t, netboxfake.New(), cc, defaultAddonProfile())
+
+	reconcileCC(t, r, cc)
+
+	hr := &unstructured.Unstructured{}
+	hr.SetGroupVersionKind(helmReleaseGVK)
+	if err := r.Get(context.Background(), types.NamespacedName{
+		Name: "ml-train-cilium", Namespace: "tenant-acme",
+	}, hr); err != nil {
+		t.Fatalf("HelmRelease ml-train-cilium not found: %v", err)
+	}
+	clusterName, _, _ := unstructured.NestedString(hr.Object, "spec", "clusterName")
+	if clusterName != "ml-train" {
+		t.Errorf("spec.clusterName = %q, want %q", clusterName, "ml-train")
+	}
+}
+
+// Story 5.2 — Cilium (order=1) gets spec.bootstrap=true.
+func TestClusterClaim_StepWatchAddons_SetBootstrapTrueForOrder1(t *testing.T) {
+	cc := newClusterReadyCC("ml-train", "tenant-acme")
+	r := newCCReconciler(t, netboxfake.New(), cc, defaultAddonProfile())
+
+	reconcileCC(t, r, cc)
+
+	hr := &unstructured.Unstructured{}
+	hr.SetGroupVersionKind(helmReleaseGVK)
+	if err := r.Get(context.Background(), types.NamespacedName{
+		Name: "ml-train-cilium", Namespace: "tenant-acme",
+	}, hr); err != nil {
+		t.Fatalf("HelmRelease not found: %v", err)
+	}
+	bootstrap, _, _ := unstructured.NestedBool(hr.Object, "spec", "bootstrap")
+	if !bootstrap {
+		t.Error("expected spec.bootstrap=true for cilium (order=1)")
+	}
+}
+
+// Story 5.2 — Addons with order>1 get spec.bootstrap=false.
+func TestClusterClaim_StepWatchAddons_SetBootstrapFalseForOtherOrders(t *testing.T) {
+	ap := defaultAddonProfile()
+	ap.Spec.Components = append(ap.Spec.Components, portalv1alpha1.AddonComponent{
+		Name: "ingress", Required: true, Order: 2,
+		HelmRef: portalv1alpha1.HelmRef{
+			RepoURL: "https://helm.example.com", ChartName: "ingress", ChartVersion: "1.0.0",
+		},
+	})
+	cc := newClusterReadyCC("ml-train", "tenant-acme")
+	r := newCCReconciler(t, netboxfake.New(), cc, ap)
+
+	reconcileCC(t, r, cc)
+
+	hr := &unstructured.Unstructured{}
+	hr.SetGroupVersionKind(helmReleaseGVK)
+	if err := r.Get(context.Background(), types.NamespacedName{
+		Name: "ml-train-ingress", Namespace: "tenant-acme",
+	}, hr); err != nil {
+		t.Fatalf("ingress HelmRelease not found: %v", err)
+	}
+	bootstrap, _, _ := unstructured.NestedBool(hr.Object, "spec", "bootstrap")
+	if bootstrap {
+		t.Error("expected spec.bootstrap=false for ingress (order=2)")
+	}
+}
+
+// Story 5.1 — Required addon not yet ready → phase stays ClusterReady, requeue.
+func TestClusterClaim_StepWatchAddons_RequeuedWhenNotReady(t *testing.T) {
+	cc := newClusterReadyCC("ml-train", "tenant-acme")
+	// No pre-seeded HelmRelease with ready=true — cilium is created but status is absent.
+	r := newCCReconciler(t, netboxfake.New(), cc, defaultAddonProfile())
+
+	res := reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	if got.Status.Phase != portalv1alpha1.ClusterClaimPhaseClusterReady {
+		t.Errorf("phase = %q, want ClusterReady while addons are not ready", got.Status.Phase)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("expected RequeueAfter > 0 while waiting for addons")
+	}
+}
+
+// Story 5.1 — Optional addon not ready, required ones ready → still transitions to AddonsReady.
+func TestClusterClaim_StepWatchAddons_OptionalAddonNotReady_DoesNotBlock(t *testing.T) {
+	ap := defaultAddonProfile()
+	ap.Spec.Components = append(ap.Spec.Components, portalv1alpha1.AddonComponent{
+		Name: "rook-ceph", Required: false, Order: 3,
+		HelmRef: portalv1alpha1.HelmRef{
+			RepoURL: "https://charts.rook.io", ChartName: "rook-ceph", ChartVersion: "1.15.0",
+		},
+	})
+	cc := newClusterReadyCC("ml-train", "tenant-acme")
+	// Required (cilium) is ready; optional (rook-ceph) has no status → not ready.
+	hr := readyHelmRelease("ml-train", "cilium", "tenant-acme")
+	r := newCCReconciler(t, netboxfake.New(), cc, ap, hr)
+
+	reconcileCC(t, r, cc)
+
+	got := getCC(t, r, cc)
+	if got.Status.Phase != portalv1alpha1.ClusterClaimPhaseAddonsReady {
+		t.Errorf("phase = %q, want AddonsReady (optional not-ready should not block)", got.Status.Phase)
+	}
+}
+
+// Story 5.3 — OSD disks from status.osdDevices are injected as inline Helm values into rook-ceph.
+func TestClusterClaim_StepWatchAddons_InjectsOSDValues(t *testing.T) {
+	ap := defaultAddonProfile()
+	ap.Spec.Components = []portalv1alpha1.AddonComponent{
+		{Name: "rook-ceph", Required: false, Order: 1,
+			HelmRef: portalv1alpha1.HelmRef{
+				RepoURL: "https://charts.rook.io", ChartName: "rook-ceph", ChartVersion: "1.15.0",
+			}},
+	}
+	cc := newClusterReadyCC("ml-train", "tenant-acme")
+	cc.Status.OSDDevices = map[string][]string{"100": {"sdb", "sdc"}}
+	r := newCCReconciler(t, netboxfake.New(), cc, ap)
+
+	reconcileCC(t, r, cc)
+
+	hr := &unstructured.Unstructured{}
+	hr.SetGroupVersionKind(helmReleaseGVK)
+	if err := r.Get(context.Background(), types.NamespacedName{
+		Name: "ml-train-rook-ceph", Namespace: "tenant-acme",
+	}, hr); err != nil {
+		t.Fatalf("rook-ceph HelmRelease not found: %v", err)
+	}
+	values, _, _ := unstructured.NestedString(hr.Object, "spec", "values")
+	for _, want := range []string{"sdb", "sdc", "100"} {
+		if !strings.Contains(values, want) {
+			t.Errorf("expected spec.values to contain %q (OSD config), got: %q", want, values)
+		}
+	}
+}
 
 // NOT TESTED: OSD disk collection (status.OSDDevices).
 // stepProvision calls ListOSDDisks for each allocated machine and stores the result
