@@ -55,6 +55,50 @@ jobs:
           push: ${{ github.ref == 'refs/heads/main' }}
           tags: ghcr.io/smeltry-io/smeltry-operator:${{ github.sha }},ghcr.io/smeltry-io/smeltry-operator:latest
 
+  sbom:
+    name: Generate and sign SBOM
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      packages: read
+      id-token: write # required for keyless Cosign signing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/smeltry-io/smeltry-operator:${{ github.sha }}
+          format: spdx-json
+          output-file: smeltry-operator-${{ github.sha }}.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 90
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with Cosign (keyless)
+        run: |
+          cosign sign --yes \
+            ghcr.io/smeltry-io/smeltry-operator:${{ github.sha }}
+
+      - name: Attach SBOM attestation with Cosign
+        run: |
+          cosign attest --yes \
+            --predicate smeltry-operator-${{ github.sha }}.spdx.json \
+            --type spdxjson \
+            ghcr.io/smeltry-io/smeltry-operator:${{ github.sha }}
+
   dco:
     name: DCO check
     runs-on: ubuntu-latest
