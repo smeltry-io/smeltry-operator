@@ -61,4 +61,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: aevea/action-dco@v1.2.0
+      - name: Check Signed-off-by on all commits in PR
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          # On push to main, only check the latest commit
+          if [ -z "$BASE" ]; then
+            BASE="HEAD~1"
+            HEAD="HEAD"
+          fi
+          MISSING=$(git log "${BASE}..${HEAD}" --format="%H %s" | while read sha subject; do
+            if ! git log -1 --format="%B" "$sha" | grep -q "^Signed-off-by:"; then
+              echo "  $sha $subject"
+            fi
+          done)
+          if [ -n "$MISSING" ]; then
+            echo "The following commits are missing a Signed-off-by line:"
+            echo "$MISSING"
+            exit 1
+          fi
+          echo "All commits have a Signed-off-by line."
