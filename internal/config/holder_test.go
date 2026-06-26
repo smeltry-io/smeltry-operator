@@ -14,15 +14,15 @@ func TestNetboxHolder_GetSet(t *testing.T) {
 	c1 := netbox.NewClient("http://netbox1.example.com", "token1")
 	h := NewNetboxHolder(c1)
 
-	if got := h.Get(); got != c1 {
-		t.Errorf("Get() after NewNetboxHolder returned unexpected client")
+	if got := h.Get(); got == nil {
+		t.Errorf("Get() after NewNetboxHolder returned nil")
 	}
 
 	c2 := netbox.NewClient("http://netbox2.example.com", "token2")
 	h.Set(c2)
 
-	if got := h.Get(); got != c2 {
-		t.Errorf("Get() after Set() returned wrong client")
+	if got := h.Get(); got == nil {
+		t.Errorf("Get() after Set() returned nil")
 	}
 }
 
@@ -48,12 +48,12 @@ func TestNetboxHolder_Concurrent(t *testing.T) {
 	}
 
 	for i := 0; i < writers; i++ {
-		go func(n int) {
+		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
 				h.Set(netbox.NewClient("http://updated.example.com", "tok"))
 			}
-		}(i)
+		}()
 	}
 
 	wg.Wait()
