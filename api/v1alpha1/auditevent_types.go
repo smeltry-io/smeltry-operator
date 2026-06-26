@@ -10,7 +10,7 @@ import (
 // AuditEvent types emitted by smeltry-operator.
 const (
 	AuditTypePhaseChanged    = "PhaseChanged"
-	AuditTypeMachineAlloced  = "MachineAllocated"
+	AuditTypeMachineAllocated = "MachineAllocated"
 	AuditTypeIPAllocated     = "IPAllocated"
 	AuditTypeClusterDeleted  = "ClusterDeleted"
 	AuditTypeServerDeleted   = "ServerDeleted"

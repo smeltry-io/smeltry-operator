@@ -154,6 +154,7 @@ func (r *ClusterClaimReconciler) stepValidate(ctx context.Context, cc *portalv1a
 	if err := r.Status().Update(ctx, cc); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Best-effort: failure is logged but does not block reconciliation.
 	emitAuditEvent(ctx, r.Client, cc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
 		Type:         portalv1alpha1.AuditTypePhaseChanged,
 		ResourceKind: "ClusterClaim",
@@ -229,8 +230,9 @@ func (r *ClusterClaimReconciler) stepProvision(ctx context.Context, cc *portalv1
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 			}
 			cc.Status.AllocatedMachineIDs = append(cc.Status.AllocatedMachineIDs, m.ID)
+			// Best-effort: failure is logged but does not block reconciliation.
 			emitAuditEvent(ctx, r.Client, cc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
-				Type:         portalv1alpha1.AuditTypeMachineAlloced,
+				Type:         portalv1alpha1.AuditTypeMachineAllocated,
 				ResourceKind: "ClusterClaim",
 				ResourceName: cc.Name,
 				MachineID:    m.ID,
@@ -504,6 +506,7 @@ func (r *ClusterClaimReconciler) reconcileDelete(ctx context.Context, cc *portal
 	// CAPI objects are deleted by ownerReference cascade.
 	// machinecfg will delete Hardware objects when machines leave staged status.
 
+	// Best-effort: failure is logged but does not block finalizer execution.
 	emitAuditEvent(ctx, r.Client, cc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
 		Type:         portalv1alpha1.AuditTypeClusterDeleted,
 		ResourceKind: "ClusterClaim",

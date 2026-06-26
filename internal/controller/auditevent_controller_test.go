@@ -9,6 +9,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -71,8 +72,9 @@ func TestAuditEventPurge_DeletesExpiredEvent(t *testing.T) {
 	}
 
 	got := &portalv1alpha1.AuditEvent{}
-	if err := r.Get(context.Background(), types.NamespacedName{Name: ev.Name, Namespace: ev.Namespace}, got); err == nil {
-		t.Error("expected expired AuditEvent to be deleted, but it still exists")
+	err = r.Get(context.Background(), types.NamespacedName{Name: ev.Name, Namespace: ev.Namespace}, got)
+	if !k8serrors.IsNotFound(err) {
+		t.Errorf("expected expired AuditEvent to be deleted (IsNotFound), got err=%v", err)
 	}
 }
 
@@ -81,11 +83,14 @@ func TestAuditEventPurge_KeepsRecentEvent(t *testing.T) {
 	ev := makeAuditEvent("ev-new", "tenant-acme", 5*24*time.Hour, "720h") // 5 days old, TTL 30 days
 	r := newPurgeReconciler(t, 720*time.Hour, ev)
 
-	_, err := r.Reconcile(context.Background(), ctrl.Request{
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ev.Name, Namespace: ev.Namespace},
 	})
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("expected RequeueAfter > 0 for a non-expired event, got %v", res.RequeueAfter)
 	}
 
 	got := &portalv1alpha1.AuditEvent{}
@@ -178,7 +183,7 @@ func TestClusterClaim_EmitsAuditEvent_OnMachineAllocation(t *testing.T) {
 	}
 	machineEvents := 0
 	for _, ev := range list.Items {
-		if ev.Spec.Type == portalv1alpha1.AuditTypeMachineAlloced {
+		if ev.Spec.Type == portalv1alpha1.AuditTypeMachineAllocated {
 			machineEvents++
 		}
 	}

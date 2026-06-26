@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,7 +81,7 @@ func emitAuditEvent(ctx context.Context, c client.Client, namespace, defaultTTL 
 
 	ev := &portalv1alpha1.AuditEvent{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("%s-%s-", spec.ResourceName, spec.Type),
+			GenerateName: fmt.Sprintf("%s-%s-", spec.ResourceName, strings.ToLower(spec.Type)),
 			Namespace:    namespace,
 		},
 		Spec: spec,
