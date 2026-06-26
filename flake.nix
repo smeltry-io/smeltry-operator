@@ -17,7 +17,9 @@
           version = self.shortRev or "dev";
           src = ./.;
           vendorHash = null; # set after first `nix build` with `go mod vendor`
-          CGO_ENABLED = "0";
+          # CGO_ENABLED is already 0 by default in buildGoModule; setting it
+          # as a top-level derivation arg conflicts with newer nixpkgs env handling.
+          env.CGO_ENABLED = "0";
           ldflags = [
             "-s" "-w"
             "-extldflags=-static"
@@ -27,7 +29,7 @@
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            go_1_22
+            go # tracks the current stable Go in nixpkgs (go_1_22 was removed)
             golangci-lint
             controller-gen
             kubectl
