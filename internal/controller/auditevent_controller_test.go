@@ -10,7 +10,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -21,21 +20,12 @@ import (
 	netboxfake "github.com/smeltry-io/smeltry-operator/internal/netbox/fake"
 )
 
-// ── Scheme ────────────────────────────────────────────────────────────────────
-
-func newAuditScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	s := newClusterClaimScheme(t)
-	return s
-}
-
 // ── AuditEventPurgeReconciler helpers ────────────────────────────────────────
 
 func newPurgeReconciler(t *testing.T, defaultTTL time.Duration, objs ...client.Object) *AuditEventPurgeReconciler {
 	t.Helper()
-	s := newAuditScheme(t)
 	return &AuditEventPurgeReconciler{
-		Client:     fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build(),
+		Client:     fake.NewClientBuilder().WithScheme(newClusterClaimScheme(t)).WithObjects(objs...).Build(),
 		DefaultTTL: defaultTTL,
 	}
 }
@@ -115,6 +105,26 @@ func TestAuditEventPurge_UsesDefaultTTL(t *testing.T) {
 	got := &portalv1alpha1.AuditEvent{}
 	if err := r.Get(context.Background(), types.NamespacedName{Name: ev.Name, Namespace: ev.Namespace}, got); err == nil {
 		t.Error("expected AuditEvent with default TTL to be deleted after expiry")
+	}
+}
+
+// Story 10.4 — An AuditEvent with an invalid spec.ttl falls back to the default TTL.
+func TestAuditEventPurge_InvalidTTLFallsBackToDefault(t *testing.T) {
+	// Default TTL = 1h, event is 2h old → should be deleted despite invalid spec.ttl.
+	ev := makeAuditEvent("ev-badttl", "tenant-acme", 2*time.Hour, "not-a-duration")
+	r := newPurgeReconciler(t, time.Hour, ev)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: ev.Name, Namespace: ev.Namespace},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &portalv1alpha1.AuditEvent{}
+	err = r.Get(context.Background(), types.NamespacedName{Name: ev.Name, Namespace: ev.Namespace}, got)
+	if !k8serrors.IsNotFound(err) {
+		t.Errorf("expected AuditEvent with invalid TTL to be deleted using default, got err=%v", err)
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,7 +52,7 @@ func (r *AuditEventPurgeReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	log.Info("deleting expired AuditEvent", "name", ev.Name, "namespace", ev.Namespace)
-	if err := r.Delete(ctx, ev); err != nil && !errors.IsNotFound(err) {
+	if err := r.Delete(ctx, ev); err != nil && !k8serrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
@@ -81,7 +81,7 @@ func emitAuditEvent(ctx context.Context, c client.Client, namespace, defaultTTL 
 
 	ev := &portalv1alpha1.AuditEvent{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("%s-%s-", spec.ResourceName, strings.ToLower(spec.Type)),
+			GenerateName: fmt.Sprintf("%s-%s-", strings.ToLower(spec.ResourceName), strings.ToLower(spec.Type)),
 			Namespace:    namespace,
 		},
 		Spec: spec,

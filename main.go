@@ -88,6 +88,15 @@ func main() {
 	ctrl.SetLogger(logr.FromSlogHandler(handler))
 	setupLog := ctrl.Log.WithName("setup")
 
+	// ── Validate flags ────────────────────────────────────────────────────
+	auditTTLDuration, err := time.ParseDuration(auditTTL)
+	if err != nil {
+		// Fail fast: an invalid TTL would cause every AuditEvent to be
+		// unpurgeable, silently filling etcd.
+		setupLog.Error(err, "invalid --audit-ttl value", "value", auditTTL)
+		os.Exit(1)
+	}
+
 	// ── Prometheus custom metrics ──────────────────────────────────────────
 	metrics.Register()
 
@@ -168,7 +177,7 @@ func main() {
 		NetboxToken:     netboxToken,
 		NetboxURL:       netboxURL,
 		MachinecfgImage: machinecfgImage,
-		DefaultAuditTTL: auditTTL,
+		DefaultAuditTTL: auditTTL, // pre-validated duration string
 	}).SetupWithManagerOptions(mgr, maxWorkers); err != nil {
 		setupLog.Error(err, "unable to create ClusterClaim controller")
 		os.Exit(1)
@@ -187,13 +196,7 @@ func main() {
 	if err := (&controller.AuditEventPurgeReconciler{
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
-		DefaultTTL: func() time.Duration {
-			d, err := time.ParseDuration(auditTTL)
-			if err != nil {
-				return 720 * time.Hour
-			}
-			return d
-		}(),
+		DefaultTTL: auditTTLDuration,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create AuditEventPurge controller")
 		os.Exit(1)
