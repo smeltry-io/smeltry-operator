@@ -89,8 +89,7 @@ func (r *ClusterClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	case portalv1alpha1.ClusterClaimPhaseAddonsReady:
 		return r.stepExposeKubeconfig(ctx, cc)
 	case portalv1alpha1.ClusterClaimPhaseReady:
-		// Nothing to do — watch for external changes (CAPI cluster health).
-		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+		return r.stepReconcileReady(ctx, cc)
 	case portalv1alpha1.ClusterClaimPhaseFailed:
 		// Terminal state; user must delete and recreate.
 		return ctrl.Result{}, nil
@@ -361,6 +360,92 @@ func (r *ClusterClaimReconciler) stepExposeKubeconfig(ctx context.Context, cc *p
 	cc.Status.Phase = portalv1alpha1.ClusterClaimPhaseReady
 	cc.Status.KubeconfigSecret = secretName
 	return ctrl.Result{}, r.Status().Update(ctx, cc)
+}
+
+// ── Step 5 : Steady-state reconciliation (Ready phase) ────────────────────
+
+const annotationDeleteAt = "portal.smeltry.io/delete-at"
+
+func (r *ClusterClaimReconciler) stepReconcileReady(ctx context.Context, cc *portalv1alpha1.ClusterClaim) (ctrl.Result, error) {
+	// Grace-period deletion: if the annotation is set and its timestamp has passed,
+	// trigger a real Kubernetes deletion so the finalizer can clean up.
+	if deleteAt, ok := cc.Annotations[annotationDeleteAt]; ok {
+		t, err := time.Parse(time.RFC3339, deleteAt)
+		if err == nil {
+			if time.Now().After(t) {
+				return ctrl.Result{}, r.Delete(ctx, cc)
+			}
+			return ctrl.Result{RequeueAfter: time.Until(t) + time.Second}, nil
+		}
+	}
+
+	desired := cc.Spec.MachineCount
+	actual := len(cc.Status.AllocatedMachineIDs)
+
+	switch {
+	case desired > actual:
+		return r.scaleUp(ctx, cc, desired-actual)
+	case desired < actual:
+		return r.scaleDown(ctx, cc, actual-desired)
+	}
+
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+// scaleUp allocates delta additional machines from Netbox and records them in status.
+func (r *ClusterClaimReconciler) scaleUp(ctx context.Context, cc *portalv1alpha1.ClusterClaim, delta int) (ctrl.Result, error) {
+	site := &portalv1alpha1.SiteConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cc.Spec.Site, Namespace: portalSystemNamespace}, site); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	available, err := r.NetboxHolder.Get().ListAvailableDevices(ctx, site.Spec.Netbox.SiteSlug, cc.Spec.MachineClass)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+	}
+	if len(available) < delta {
+		setCondition(cc, "ScaleUpBlocked", metav1.ConditionTrue, "InsufficientMachines",
+			fmt.Sprintf("need %d more machines of class %q, only %d available", delta, cc.Spec.MachineClass, len(available)))
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, r.Status().Update(ctx, cc)
+	}
+
+	tenantSlug := tenantFromNamespace(cc.Namespace)
+	for i := 0; i < delta; i++ {
+		m := available[i]
+		if err := r.NetboxHolder.Get().SetDeviceStatus(ctx, m.ID, netbox.DeviceStatusStaged, tenantSlug); err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+		cc.Status.AllocatedMachineIDs = append(cc.Status.AllocatedMachineIDs, m.ID)
+	}
+
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, r.Status().Update(ctx, cc)
+}
+
+// scaleDown releases delta machines back to Netbox. It is blocked when rook-ceph
+// is part of the AddonProfile, because OSD removal requires manual Ceph rebalancing.
+func (r *ClusterClaimReconciler) scaleDown(ctx context.Context, cc *portalv1alpha1.ClusterClaim, delta int) (ctrl.Result, error) {
+	ap := &portalv1alpha1.AddonProfile{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cc.Spec.AddonProfile, Namespace: portalSystemNamespace}, ap); err != nil {
+		return ctrl.Result{}, err
+	}
+	for _, comp := range ap.Spec.Components {
+		if comp.Name == "rook-ceph" {
+			setCondition(cc, "ScaleDownBlocked", metav1.ConditionTrue, "RookCephPresent",
+				"scale down is forbidden when rook-ceph is part of the addon profile")
+			return ctrl.Result{}, r.Status().Update(ctx, cc)
+		}
+	}
+
+	// Release the last `delta` machine IDs (LIFO order, arbitrary but deterministic).
+	toRelease := cc.Status.AllocatedMachineIDs[len(cc.Status.AllocatedMachineIDs)-delta:]
+	for _, id := range toRelease {
+		if err := r.NetboxHolder.Get().SetDeviceStatus(ctx, id, netbox.DeviceStatusActive, ""); err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+	}
+	cc.Status.AllocatedMachineIDs = cc.Status.AllocatedMachineIDs[:len(cc.Status.AllocatedMachineIDs)-delta]
+
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, r.Status().Update(ctx, cc)
 }
 
 // ── Deletion finalizer ─────────────────────────────────────────────────────
