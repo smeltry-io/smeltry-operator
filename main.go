@@ -70,6 +70,9 @@ func main() {
 		"How often to poll Netbox for tenant changes.")
 	flag.StringVar(&machinecfgImage, "machinecfg-image", "ghcr.io/smeltry-io/machinecfg:latest",
 		"Container image for the machinecfg Job.")
+	var auditTTL string
+	flag.StringVar(&auditTTL, "audit-ttl", "720h",
+		"Default TTL for AuditEvent objects (Go duration, e.g. '720h' = 30 days).")
 	flag.Parse()
 
 	// ── Logging (slog JSON) ────────────────────────────────────────────────
@@ -84,6 +87,15 @@ func main() {
 	// Bridge controller-runtime to slog via logr.
 	ctrl.SetLogger(logr.FromSlogHandler(handler))
 	setupLog := ctrl.Log.WithName("setup")
+
+	// ── Validate flags ────────────────────────────────────────────────────
+	auditTTLDuration, err := time.ParseDuration(auditTTL)
+	if err != nil {
+		// Fail fast: an invalid TTL would cause every AuditEvent to be
+		// unpurgeable, silently filling etcd.
+		setupLog.Error(err, "invalid --audit-ttl value", "value", auditTTL)
+		os.Exit(1)
+	}
 
 	// ── Prometheus custom metrics ──────────────────────────────────────────
 	metrics.Register()
@@ -159,12 +171,13 @@ func main() {
 
 	// ── Controllers ───────────────────────────────────────────────────────
 	if err := (&controller.ClusterClaimReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		NetboxHolder: nbHolder,
-		NetboxToken:  netboxToken,
-		NetboxURL:    netboxURL,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		NetboxHolder:    nbHolder,
+		NetboxToken:     netboxToken,
+		NetboxURL:       netboxURL,
 		MachinecfgImage: machinecfgImage,
+		DefaultAuditTTL: auditTTL, // pre-validated duration string
 	}).SetupWithManagerOptions(mgr, maxWorkers); err != nil {
 		setupLog.Error(err, "unable to create ClusterClaim controller")
 		os.Exit(1)
@@ -177,6 +190,15 @@ func main() {
 		PollInterval: netboxPollInterval,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create NetboxTenant controller")
+		os.Exit(1)
+	}
+
+	if err := (&controller.AuditEventPurgeReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		DefaultTTL: auditTTLDuration,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create AuditEventPurge controller")
 		os.Exit(1)
 	}
 
