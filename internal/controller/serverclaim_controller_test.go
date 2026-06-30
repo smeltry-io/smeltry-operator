@@ -323,6 +323,105 @@ func TestServerClaim_Finalizer_ReleasesResources(t *testing.T) {
 	}
 }
 
+// ── Story 10.1 — AuditEvent emission from ServerClaimReconciler ──────────────
+
+func newSCReconcilerWithAudit(t *testing.T, nb *netboxfake.Client, objs ...client.Object) *ServerClaimReconciler {
+	t.Helper()
+	s := newServerClaimScheme(t)
+	return &ServerClaimReconciler{
+		Client:          fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).WithStatusSubresource(&portalv1alpha1.ServerClaim{}).Build(),
+		Scheme:          s,
+		NetboxHolder:    config.NewNetboxHolder(nb),
+		NetboxURL:       "http://netbox.test",
+		NetboxToken:     "testtoken",
+		MachinecfgImage: "ghcr.io/smeltry-io/machinecfg:test",
+		DefaultAuditTTL: "720h",
+	}
+}
+
+// Story 10.1 — A PhaseChanged AuditEvent is emitted when Pending transitions to Provisioning.
+func TestServerClaim_EmitsAuditEvent_OnPhaseTransition(t *testing.T) {
+	nb := netboxfake.New()
+	nb.Devices = []netbox.Device{defaultDevice()}
+	sc := newSC("srv-audit-phase", "tenant-acme", "paris-dc1")
+	r := newSCReconcilerWithAudit(t, nb, sc, defaultSiteConfig())
+
+	reconcileSC(t, r, sc) // validate → Provisioning
+
+	list := &portalv1alpha1.AuditEventList{}
+	if err := r.List(context.Background(), list, client.InNamespace("tenant-acme")); err != nil {
+		t.Fatalf("List AuditEvents: %v", err)
+	}
+	found := false
+	for _, ev := range list.Items {
+		if ev.Spec.Type == portalv1alpha1.AuditTypePhaseChanged &&
+			ev.Spec.ResourceName == "srv-audit-phase" &&
+			ev.Spec.NewPhase == string(portalv1alpha1.ServerClaimPhaseProvisioning) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected PhaseChanged AuditEvent for srv-audit-phase → Provisioning, got %d events", len(list.Items))
+	}
+}
+
+// Story 10.1 — A MachineAllocated AuditEvent is emitted when a machine is staged in Netbox.
+func TestServerClaim_EmitsAuditEvent_OnMachineAllocation(t *testing.T) {
+	nb := netboxfake.New()
+	nb.Devices = []netbox.Device{defaultDevice()}
+	sc := newSC("srv-audit-machine", "tenant-acme", "paris-dc1")
+	r := newSCReconcilerWithAudit(t, nb, sc, defaultSiteConfig())
+
+	reconcileSC(t, r, sc) // validate → Provisioning
+	reconcileSC(t, r, sc) // provision: IP + machine + Job
+
+	list := &portalv1alpha1.AuditEventList{}
+	if err := r.List(context.Background(), list, client.InNamespace("tenant-acme")); err != nil {
+		t.Fatalf("List AuditEvents: %v", err)
+	}
+	found := false
+	for _, ev := range list.Items {
+		if ev.Spec.Type == portalv1alpha1.AuditTypeMachineAllocated &&
+			ev.Spec.ResourceName == "srv-audit-machine" &&
+			ev.Spec.MachineID == 10 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected MachineAllocated AuditEvent for srv-audit-machine (machineID=10), got %d events", len(list.Items))
+	}
+}
+
+// Story 10.1 — A ServerDeleted AuditEvent is emitted when the finalizer runs.
+func TestServerClaim_EmitsAuditEvent_OnDeletion(t *testing.T) {
+	nb := netboxfake.New()
+	nb.Devices = []netbox.Device{defaultDevice()}
+	sc := newSC("srv-audit-delete", "tenant-acme", "paris-dc1")
+	r := newSCReconcilerWithAudit(t, nb, sc, defaultSiteConfig())
+
+	reconcileSC(t, r, sc) // validate
+	reconcileSC(t, r, sc) // provision
+
+	if err := r.Delete(context.Background(), sc); err != nil {
+		t.Fatalf("delete ServerClaim: %v", err)
+	}
+	reconcileSC(t, r, sc) // finalizer → ServerDeleted
+
+	list := &portalv1alpha1.AuditEventList{}
+	if err := r.List(context.Background(), list, client.InNamespace("tenant-acme")); err != nil {
+		t.Fatalf("List AuditEvents: %v", err)
+	}
+	found := false
+	for _, ev := range list.Items {
+		if ev.Spec.Type == portalv1alpha1.AuditTypeServerDeleted && ev.Spec.ResourceName == "srv-audit-delete" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected ServerDeleted AuditEvent for srv-audit-delete, got %d events", len(list.Items))
+	}
+}
+
 // ── Idempotence — double réconciliation sans effet de bord ───────────────────
 
 func TestServerClaim_Idempotent_NoDoubleAlloc(t *testing.T) {
