@@ -34,6 +34,7 @@ type ServerClaimReconciler struct {
 	NetboxToken     string
 	NetboxURL       string
 	MachinecfgImage string
+	DefaultAuditTTL string
 }
 
 // +kubebuilder:rbac:groups=portal.smeltry.io,resources=serverclaims,verbs=get;list;watch;create;update;patch;delete
@@ -94,8 +95,19 @@ func (r *ServerClaimReconciler) stepValidate(ctx context.Context, sc *portalv1al
 			fmt.Sprintf("no machine of class %q available on site %q", sc.Spec.MachineClass, sc.Spec.Site))
 	}
 
+	oldPhase := string(sc.Status.Phase)
 	sc.Status.Phase = portalv1alpha1.ServerClaimPhaseProvisioning
-	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, sc)
+	if err := r.Status().Update(ctx, sc); err != nil {
+		return ctrl.Result{}, err
+	}
+	emitAuditEvent(ctx, r.Client, sc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
+		Type:         portalv1alpha1.AuditTypePhaseChanged,
+		ResourceKind: "ServerClaim",
+		ResourceName: sc.Name,
+		OldPhase:     oldPhase,
+		NewPhase:     string(portalv1alpha1.ServerClaimPhaseProvisioning),
+	})
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // ── Step 2 : Provision (IP → machine → machinecfg Job → Ready) ───────────
@@ -149,6 +161,12 @@ func (r *ServerClaimReconciler) stepProvision(ctx context.Context, sc *portalv1a
 		if err := r.Status().Update(ctx, sc); err != nil {
 			return ctrl.Result{}, err
 		}
+		emitAuditEvent(ctx, r.Client, sc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
+			Type:         portalv1alpha1.AuditTypeMachineAllocated,
+			ResourceKind: "ServerClaim",
+			ResourceName: sc.Name,
+			MachineID:    m.ID,
+		})
 	}
 
 	// 2c. Create machinecfg Job (idempotent).
@@ -198,6 +216,11 @@ func (r *ServerClaimReconciler) reconcileDelete(ctx context.Context, sc *portalv
 		}
 	}
 
+	emitAuditEvent(ctx, r.Client, sc.Namespace, r.DefaultAuditTTL, portalv1alpha1.AuditEventSpec{
+		Type:         portalv1alpha1.AuditTypeServerDeleted,
+		ResourceKind: "ServerClaim",
+		ResourceName: sc.Name,
+	})
 	controllerutil.RemoveFinalizer(sc, serverClaimFinalizer)
 	return ctrl.Result{}, r.Update(ctx, sc)
 }
