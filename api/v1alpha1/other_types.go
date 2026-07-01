@@ -229,9 +229,41 @@ type SiteConfigSpec struct {
 	OIDC    SiteOIDCConfig    `json:"oidc"`
 }
 
-// SiteConfigStatus reflects validation results checked by the admission webhook.
+// MachineCharacteristics summarizes hardware specifications for a machine class.
+// Values are derived from the Netbox device type; fields are omitted if not available.
+type MachineCharacteristics struct {
+	CPUCores  int `json:"cpuCores,omitempty"`
+	RAMGB     int `json:"ramGB,omitempty"`
+	StorageGB int `json:"storageGB,omitempty"`
+}
+
+// MachineClassSummary aggregates machine availability for one class on a site.
+// The operator populates this from Netbox and stores it in SiteConfig.status.machineClasses.
+type MachineClassSummary struct {
+	// MachineClass is the Netbox device model name (matches ClusterClaim.spec.machineClass).
+	MachineClass string `json:"machineClass"`
+
+	// AvailableCount is the number of active, unassigned devices of this class on the site.
+	AvailableCount int `json:"availableCount"`
+
+	// Tags are the Netbox device tags present on the devices of this class.
+	Tags []string `json:"tags,omitempty"`
+
+	// Characteristics summarizes hardware specs; may be empty if not available in Netbox.
+	Characteristics MachineCharacteristics `json:"characteristics,omitempty"`
+}
+
+// SiteConfigStatus reflects validation results and machine availability synced from Netbox.
 type SiteConfigStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// MachineClasses lists available machine classes on this site, refreshed from Netbox.
+	// An empty slice (not nil) means the site was synced but has no active machines.
+	// Nil means the site has never been synced.
+	MachineClasses []MachineClassSummary `json:"machineClasses"`
+
+	// LastMachineSync is the timestamp of the last successful Netbox machine sync.
+	LastMachineSync *metav1.Time `json:"lastMachineSync,omitempty"`
 }
 
 // +kubebuilder:object:root=true
