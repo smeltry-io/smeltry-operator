@@ -193,6 +193,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&controller.ServerClaimReconciler{
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		NetboxHolder:    nbHolder,
+		NetboxToken:     netboxToken,
+		NetboxURL:       netboxURL,
+		MachinecfgImage: machinecfgImage,
+		DefaultAuditTTL: auditTTL,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create ServerClaim controller")
+		os.Exit(1)
+	}
+
 	if err := (&controller.AuditEventPurgeReconciler{
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
