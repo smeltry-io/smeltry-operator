@@ -58,6 +58,22 @@ func (c *Client) ListTenants(_ context.Context) ([]netbox.Tenant, error) {
 	return out, nil
 }
 
+func (c *Client) ListDevicesBySite(_ context.Context, siteSlug string) ([]netbox.Device, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []netbox.Device
+	for _, d := range c.Devices {
+		if d.Status.Value != netbox.DeviceStatusActive {
+			continue
+		}
+		if d.Site.Slug != siteSlug {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
 func (c *Client) ListAvailableDevices(_ context.Context, siteSlug, model string) ([]netbox.Device, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
