@@ -9,7 +9,6 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -24,7 +23,6 @@ const siteConfigPollInterval = 5 * time.Minute
 // SiteConfigReconciler syncs machine availability from Netbox into SiteConfig.status.machineClasses.
 type SiteConfigReconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
 	NetboxHolder *config.NetboxHolder
 }
 
@@ -42,13 +40,21 @@ func (r *SiteConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	devices, err := nb.ListDevicesBySite(ctx, siteSlug)
 	if err != nil {
 		logger.Error(err, "failed to list devices from Netbox", "site", siteSlug)
-		return ctrl.Result{RequeueAfter: siteConfigPollInterval}, err
+		// Requeue without returning the error to avoid exponential backoff — we
+		// poll on a fixed interval and a transient Netbox failure should not fill
+		// the work queue with retries.
+		return ctrl.Result{RequeueAfter: siteConfigPollInterval}, nil
 	}
 
 	sc.Status.MachineClasses = aggregateMachineClasses(devices)
 	now := metav1.Now()
 	sc.Status.LastMachineSync = &now
 
+	// Status().Update() may return a 409 Conflict if another actor updated the
+	// object concurrently. We return the error so controller-runtime requeues
+	// with backoff; the next reconcile will re-read and retry. This is safe in a
+	// single-replica deployment (the default) and produces at most a brief delay
+	// in a multi-replica setup.
 	if err := r.Status().Update(ctx, &sc); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -58,6 +64,7 @@ func (r *SiteConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 // aggregateMachineClasses groups active devices by model and computes per-class summaries.
 // Only devices without a tenant assignment count as available.
+// Devices with an empty DeviceType.Model (not configured in Netbox) are skipped.
 func aggregateMachineClasses(devices []netbox.Device) []portalv1alpha1.MachineClassSummary {
 	type entry struct {
 		available int
@@ -66,6 +73,11 @@ func aggregateMachineClasses(devices []netbox.Device) []portalv1alpha1.MachineCl
 	classes := make(map[string]*entry)
 
 	for _, d := range devices {
+		// Skip devices that have no device type set in Netbox — they cannot be
+		// matched against a ClusterClaim.spec.machineClass.
+		if d.DeviceType.Model == "" {
+			continue
+		}
 		e, ok := classes[d.DeviceType.Model]
 		if !ok {
 			e = &entry{tagSet: make(map[string]struct{})}
@@ -94,7 +106,7 @@ func aggregateMachineClasses(devices []netbox.Device) []portalv1alpha1.MachineCl
 		})
 	}
 
-	// Stable ordering by machineClass name.
+	// Stable ordering so status diffs are deterministic across reconcile passes.
 	sort.Slice(summaries, func(i, j int) bool {
 		return summaries[i].MachineClass < summaries[j].MachineClass
 	})

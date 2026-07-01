@@ -5,6 +5,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +36,6 @@ func newSiteConfigReconciler(t *testing.T, nb *netboxfake.Client, site *portalv1
 			WithObjects(site).
 			WithStatusSubresource(&portalv1alpha1.SiteConfig{}).
 			Build(),
-		Scheme:       s,
 		NetboxHolder: config.NewNetboxHolder(nb),
 	}
 }
@@ -187,5 +187,63 @@ func TestSiteConfigReconciler_EmptyMachineClassesWhenNoDevices(t *testing.T) {
 	}
 	if len(sc.Status.MachineClasses) != 0 {
 		t.Errorf("expected 0 entries, got %d", len(sc.Status.MachineClasses))
+	}
+}
+
+func TestSiteConfigReconciler_SkipsDevicesWithoutModel(t *testing.T) {
+	nb := netboxfake.New()
+	nb.Devices = []netbox.Device{
+		makeDevice(1, "paris-dc1", "gpu-large", "gpu"),
+		func() netbox.Device {
+			// device with no device type configured in Netbox
+			d := makeDevice(2, "paris-dc1", "")
+			d.DeviceType.Model = ""
+			return d
+		}(),
+	}
+
+	site := newSiteConfig("paris-dc1")
+	r := newSiteConfigReconciler(t, nb, site)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "paris-dc1", Namespace: "portal-system"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+
+	var sc portalv1alpha1.SiteConfig
+	must(t, r.Client.Get(context.Background(), types.NamespacedName{Name: "paris-dc1", Namespace: "portal-system"}, &sc))
+
+	if len(sc.Status.MachineClasses) != 1 {
+		t.Fatalf("expected 1 class (device without model skipped), got %d: %v", len(sc.Status.MachineClasses), sc.Status.MachineClasses)
+	}
+	if sc.Status.MachineClasses[0].MachineClass != "gpu-large" {
+		t.Errorf("expected class 'gpu-large', got %q", sc.Status.MachineClasses[0].MachineClass)
+	}
+}
+
+func TestSiteConfigReconciler_RequeuesOnNetboxError(t *testing.T) {
+	nb := netboxfake.New()
+	nb.ListDevicesBySiteErr = fmt.Errorf("netbox unavailable")
+
+	site := newSiteConfig("paris-dc1")
+	r := newSiteConfigReconciler(t, nb, site)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "paris-dc1", Namespace: "portal-system"},
+	})
+	if err != nil {
+		t.Fatalf("expected no error returned (poll-based retry), got: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("expected RequeueAfter to be set so reconcile is retried")
+	}
+
+	// Status must not have been updated — MachineClasses stays nil (never synced).
+	var sc portalv1alpha1.SiteConfig
+	must(t, r.Client.Get(context.Background(), types.NamespacedName{Name: "paris-dc1", Namespace: "portal-system"}, &sc))
+	if sc.Status.MachineClasses != nil {
+		t.Errorf("MachineClasses should be nil when sync failed, got %v", sc.Status.MachineClasses)
 	}
 }

@@ -102,6 +102,11 @@ type Device struct {
 	} `json:"tags"`
 }
 
+// netboxDevicePageSize is the maximum number of devices returned in a single Netbox
+// API call. Sites with more devices than this will be silently truncated until
+// pagination support is added. 1 000 covers all known deployments today.
+const netboxDevicePageSize = "1000"
+
 // ListAvailableDevices returns active, unassigned devices matching site and model.
 func (c *Client) ListAvailableDevices(ctx context.Context, siteSlug, model string) ([]Device, error) {
 	q := url.Values{}
@@ -109,7 +114,7 @@ func (c *Client) ListAvailableDevices(ctx context.Context, siteSlug, model strin
 	q.Set("device_type__model", model)
 	q.Set("status", "active")
 	q.Set("tenant_id__isnull", "true") // not yet assigned to a tenant
-	q.Set("limit", "1000")
+	q.Set("limit", netboxDevicePageSize)
 
 	resp, err := c.do(ctx, http.MethodGet, "/api/dcim/devices/?"+q.Encode(), nil)
 	if err != nil {
@@ -129,7 +134,7 @@ func (c *Client) ListDevicesBySite(ctx context.Context, siteSlug string) ([]Devi
 	q := url.Values{}
 	q.Set("site", siteSlug)
 	q.Set("status", "active")
-	q.Set("limit", "1000")
+	q.Set("limit", netboxDevicePageSize)
 
 	resp, err := c.do(ctx, http.MethodGet, "/api/dcim/devices/?"+q.Encode(), nil)
 	if err != nil {

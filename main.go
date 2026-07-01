@@ -208,7 +208,6 @@ func main() {
 
 	if err := (&controller.SiteConfigReconciler{
 		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
 		NetboxHolder: nbHolder,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create SiteConfig controller")

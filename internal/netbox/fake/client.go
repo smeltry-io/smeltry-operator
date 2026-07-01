@@ -35,6 +35,8 @@ type Client struct {
 
 	// ListTenantsErr, if non-nil, is returned by ListTenants.
 	ListTenantsErr error
+	// ListDevicesBySiteErr, if non-nil, is returned by ListDevicesBySite.
+	ListDevicesBySiteErr error
 }
 
 // New returns an empty fake client ready for use.
@@ -61,6 +63,9 @@ func (c *Client) ListTenants(_ context.Context) ([]netbox.Tenant, error) {
 func (c *Client) ListDevicesBySite(_ context.Context, siteSlug string) ([]netbox.Device, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.ListDevicesBySiteErr != nil {
+		return nil, c.ListDevicesBySiteErr
+	}
 	var out []netbox.Device
 	for _, d := range c.Devices {
 		if d.Status.Value != netbox.DeviceStatusActive {
